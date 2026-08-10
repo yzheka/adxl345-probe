@@ -3,12 +3,16 @@
 # Ported from https://github.com/jniebuhr/adxl345-probe for Klipper versions
 # after the probe.py refactor that removed ProbeSessionHelper.
 #
-# Delta-friendly additions over upstream:
-#   approach_z        - descend to this Z before arming tap detection, so a
-#                       false trigger cannot ask the caller to retract above
-#                       the machine's max_z (a delta homes AT max_z)
+# Additions over upstream:
 #   min_probe_travel  - reject a trigger that happens before the effector has
 #                       actually descended, with a message that says why
+#   probe_accel       - toolhead acceleration limit applied to the probing
+#                       move only, restored afterwards
+#   rest_time         - settle dwell before arming / after disarming tap
+#                       detection (upstream hardcodes 0.1s each way)
+#
+# The accelerometer is also powered up once per probe session rather than
+# once per sample, which removes two blocking SPI round-trips per sample.
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
@@ -52,11 +56,17 @@ class ADXL345EndstopWrapper:
                                           minval=TAP_SCALE, maxval=100000.)
         self.tap_dur = config.getfloat('tap_dur', 0.01,
                                        above=DUR_SCALE, maxval=0.1)
-        # Approach height - on a delta the effector homes at max_z, so probing
-        # from the home position leaves no headroom for the caller's retract
-        self.approach_z = config.getfloat('approach_z', None)
         self.min_probe_travel = config.getfloat('min_probe_travel', 0.5,
                                                 minval=0.)
+        # Acceleration limit applied to the probing move only. The start of
+        # the move is what usually trips tap detection, so this is the main
+        # knob for false triggers.
+        self.probe_accel = config.getfloat('probe_accel', None, above=0.)
+        self.saved_accel = None
+        # Settle time before arming and after disarming tap detection. Too
+        # short and residual ringing from the retract move trips the tap.
+        self.rest_time = config.getfloat('rest_time', ADXL345_REST_TIME,
+                                         minval=0., maxval=1.)
         self.disable_fans = [f.strip()
                              for f in config.get('disable_fans', '').split(',')
                              if f.strip()]
@@ -108,31 +118,48 @@ class ADXL345EndstopWrapper:
                 fan.fan_speed = fan._fan_speed
                 fan._fan_speed = 0.
 
-    def _approach(self, gcmd):
-        # Get the effector down to a sane height before arming, so a false
-        # trigger cannot leave the caller trying to retract past max_z
-        if self.approach_z is None:
+    # --- Probing acceleration --------------------------------------------
+    def _apply_accel(self, accel):
+        toolhead = self.printer.lookup_object('toolhead')
+        setter = getattr(toolhead, 'set_max_velocities', None)
+        if setter is not None:
+            setter(None, accel, None, None)
+            return
+        # Fallback for Klipper versions without the direct setter
+        gcode = self.printer.lookup_object('gcode')
+        gcode.run_script_from_command("SET_VELOCITY_LIMIT ACCEL=%.6f"
+                                      % (accel,))
+
+    def _set_probe_accel(self):
+        if self.probe_accel is None or self.saved_accel is not None:
             return
         toolhead = self.printer.lookup_object('toolhead')
-        if toolhead.get_position()[2] <= self.approach_z:
+        systime = self.printer.get_reactor().monotonic()
+        cur_accel = toolhead.get_status(systime)['max_accel']
+        if cur_accel <= self.probe_accel:
             return
-        speed = self.param_helper.get_probe_params(gcmd)['lift_speed']
-        toolhead.manual_move([None, None, self.approach_z], speed)
+        self.saved_accel = cur_accel
+        self._apply_accel(self.probe_accel)
+
+    def _restore_accel(self):
+        if self.saved_accel is None:
+            return
+        accel = self.saved_accel
+        self.saved_accel = None
+        self._apply_accel(accel)
 
     def _arm_tap(self):
         self.activate_gcode.run_gcode_from_command()
         chip = self.adxl345
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.flush_step_generation()
-        toolhead.dwell(ADXL345_REST_TIME)
+        if self.rest_time:
+            toolhead.dwell(self.rest_time)
         print_time = toolhead.get_last_move_time()
         clock = chip.mcu.print_time_to_clock(print_time)
         chip.set_reg(REG_INT_ENABLE, 0x00, minclock=clock)
         chip.read_reg(REG_INT_SOURCE)
         chip.set_reg(REG_INT_ENABLE, 0x40, minclock=clock)
-        self.is_measuring = (chip.read_reg(adxl345.REG_POWER_CTL) == 0x08)
-        if not self.is_measuring:
-            chip.set_reg(adxl345.REG_POWER_CTL, 0x08, minclock=clock)
         if not self._try_clear_tap():
             raise self.printer.command_error(
                 "ADXL345 tap triggered before move,"
@@ -148,12 +175,11 @@ class ADXL345EndstopWrapper:
     def _disarm_tap(self):
         chip = self.adxl345
         toolhead = self.printer.lookup_object('toolhead')
-        toolhead.dwell(ADXL345_REST_TIME)
+        if self.rest_time:
+            toolhead.dwell(self.rest_time)
         print_time = toolhead.get_last_move_time()
         clock = chip.mcu.print_time_to_clock(print_time)
         chip.set_reg(REG_INT_ENABLE, 0x00, minclock=clock)
-        if not self.is_measuring:
-            chip.set_reg(adxl345.REG_POWER_CTL, 0x00)
         self.deactivate_gcode.run_gcode_from_command()
         if not self._try_clear_tap():
             raise self.printer.command_error(
@@ -164,24 +190,33 @@ class ADXL345EndstopWrapper:
     def start_probe_session(self, gcmd):
         self.homing_helper.clear_trigger_positions()
         self._control_fans(True)
+        # Power the chip up once for the whole session instead of once per
+        # sample - each set_reg is a blocking host<->MCU round-trip
+        chip = self.adxl345
+        self.is_measuring = (chip.read_reg(adxl345.REG_POWER_CTL) == 0x08)
+        if not self.is_measuring:
+            chip.set_reg(adxl345.REG_POWER_CTL, 0x08)
         self.in_session = True
         return self
 
     def run_probe(self, gcmd):
-        self._approach(gcmd)
         toolhead = self.printer.lookup_object('toolhead')
         start_z = toolhead.get_position()[2]
-        self._arm_tap()
+        self._set_probe_accel()
         try:
-            self.homing_helper.descend_until_trigger(gcmd)
-        except self.printer.command_error:
+            self._arm_tap()
             try:
-                self._disarm_tap()
-            except Exception:
-                logging.exception("adxl345_probe: error disarming tap")
-            raise
-        travel = start_z - toolhead.get_position()[2]
-        self._disarm_tap()
+                self.homing_helper.descend_until_trigger(gcmd)
+            except self.printer.command_error:
+                try:
+                    self._disarm_tap()
+                except Exception:
+                    logging.exception("adxl345_probe: error disarming tap")
+                raise
+            travel = start_z - toolhead.get_position()[2]
+            self._disarm_tap()
+        finally:
+            self._restore_accel()
         if travel < self.min_probe_travel:
             raise self.printer.command_error(
                 "ADXL345 probe triggered after only %.3fmm of travel"
@@ -195,9 +230,12 @@ class ADXL345EndstopWrapper:
 
     def end_probe_session(self):
         self.homing_helper.clear_trigger_positions()
+        self._restore_accel()
         if self.in_session:
             self.in_session = False
             self._control_fans(False)
+            if not self.is_measuring:
+                self.adxl345.set_reg(adxl345.REG_POWER_CTL, 0x00)
 
     # --- Commands ---------------------------------------------------------
     cmd_SET_ACCEL_PROBE_help = "Configure ADXL345 parameters related to probing"
@@ -208,8 +246,14 @@ class ADXL345EndstopWrapper:
                                          minval=TAP_SCALE, maxval=100000.)
         self.tap_dur = gcmd.get_float('TAP_DUR', self.tap_dur,
                                       above=DUR_SCALE, maxval=0.1)
+        self.probe_accel = gcmd.get_float('ACCEL', self.probe_accel,
+                                          above=0.)
         chip.set_reg(REG_THRESH_TAP, int(self.tap_thresh / TAP_SCALE))
         chip.set_reg(REG_DUR, int(self.tap_dur / DUR_SCALE))
+        gcmd.respond_info("tap_thresh: %.0f  tap_dur: %.5f  probe_accel: %s"
+                          % (self.tap_thresh, self.tap_dur,
+                             "none" if self.probe_accel is None
+                             else "%.0f" % (self.probe_accel,)))
 
 
 # Main external probe interface - mirrors probe.PrinterProbe
