@@ -1,9 +1,3 @@
-# ADXL345 tap-detection Z probe
-#
-# Ported from https://github.com/jniebuhr/adxl345-probe for Klipper versions
-# after the probe.py refactor that removed ProbeSessionHelper.
-#
-# This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
 from . import probe, adxl345
 
