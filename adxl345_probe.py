@@ -1,3 +1,16 @@
+# ADXL345 tap-detection Z probe
+#
+# Ported from https://github.com/jniebuhr/adxl345-probe for Klipper versions
+# after the probe.py refactor that removed ProbeSessionHelper.
+#
+# Delta-friendly additions over upstream:
+#   approach_z        - descend to this Z before arming tap detection, so a
+#                       false trigger cannot ask the caller to retract above
+#                       the machine's max_z (a delta homes AT max_z)
+#   min_probe_travel  - reject a trigger that happens before the effector has
+#                       actually descended, with a message that says why
+#
+# This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
 from . import probe, adxl345
 
@@ -19,6 +32,7 @@ ADXL345_REST_TIME = .1
 class ADXL345EndstopWrapper:
     def __init__(self, config, probe_offsets, param_helper):
         self.printer = config.get_printer()
+        self.param_helper = param_helper
         gcode_macro = self.printer.load_object(config, 'gcode_macro')
         self.activate_gcode = gcode_macro.load_template(
             config, 'activate_gcode', '')
@@ -38,6 +52,11 @@ class ADXL345EndstopWrapper:
                                           minval=TAP_SCALE, maxval=100000.)
         self.tap_dur = config.getfloat('tap_dur', 0.01,
                                        above=DUR_SCALE, maxval=0.1)
+        # Approach height - on a delta the effector homes at max_z, so probing
+        # from the home position leaves no headroom for the caller's retract
+        self.approach_z = config.getfloat('approach_z', None)
+        self.min_probe_travel = config.getfloat('min_probe_travel', 0.5,
+                                                minval=0.)
         self.disable_fans = [f.strip()
                              for f in config.get('disable_fans', '').split(',')
                              if f.strip()]
@@ -89,6 +108,17 @@ class ADXL345EndstopWrapper:
                 fan.fan_speed = fan._fan_speed
                 fan._fan_speed = 0.
 
+    def _approach(self, gcmd):
+        # Get the effector down to a sane height before arming, so a false
+        # trigger cannot leave the caller trying to retract past max_z
+        if self.approach_z is None:
+            return
+        toolhead = self.printer.lookup_object('toolhead')
+        if toolhead.get_position()[2] <= self.approach_z:
+            return
+        speed = self.param_helper.get_probe_params(gcmd)['lift_speed']
+        toolhead.manual_move([None, None, self.approach_z], speed)
+
     def _arm_tap(self):
         self.activate_gcode.run_gcode_from_command()
         chip = self.adxl345
@@ -107,6 +137,13 @@ class ADXL345EndstopWrapper:
             raise self.printer.command_error(
                 "ADXL345 tap triggered before move,"
                 " it may be set too sensitive.")
+        # The tap register is clean - if the endstop still reads triggered the
+        # problem is the pin itself, not the accelerometer
+        if self.query_endstop(toolhead.get_last_move_time()):
+            raise self.printer.command_error(
+                "ADXL345 probe pin reads TRIGGERED while the tap register is"
+                " clear. Check probe_pin polarity - remove any '^' pullup, or"
+                " add '!' if the interrupt idles high.")
 
     def _disarm_tap(self):
         chip = self.adxl345
@@ -131,6 +168,9 @@ class ADXL345EndstopWrapper:
         return self
 
     def run_probe(self, gcmd):
+        self._approach(gcmd)
+        toolhead = self.printer.lookup_object('toolhead')
+        start_z = toolhead.get_position()[2]
         self._arm_tap()
         try:
             self.homing_helper.descend_until_trigger(gcmd)
@@ -140,7 +180,15 @@ class ADXL345EndstopWrapper:
             except Exception:
                 logging.exception("adxl345_probe: error disarming tap")
             raise
+        travel = start_z - toolhead.get_position()[2]
         self._disarm_tap()
+        if travel < self.min_probe_travel:
+            raise self.printer.command_error(
+                "ADXL345 probe triggered after only %.3fmm of travel"
+                " (minimum %.3fmm). The tap threshold is probably firing on"
+                " the acceleration at the start of the move - raise"
+                " tap_thresh, lower the probing speed, or reduce the Z"
+                " acceleration." % (travel, self.min_probe_travel))
 
     def pull_probed_results(self):
         return self.homing_helper.pull_trigger_positions()
