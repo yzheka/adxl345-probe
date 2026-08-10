@@ -33,6 +33,45 @@ cd adxl345-probe
 `install.sh` symlinks `adxl345_probe.py` into `~/klipper/klippy/extras/` and
 restarts Klipper, so a `git pull` here updates the installed module in place.
 
+## Moonraker update manager
+
+Add this to `~/printer_data/config/moonraker.conf` for update notifications and
+one-click updates in Mainsail or Fluidd:
+
+```ini
+[update_manager adxl345-probe]
+type: git_repo
+path: ~/adxl345-probe
+origin: https://github.com/yzheka/adxl345-probe.git
+primary_branch: master
+managed_services: klipper
+info_tags:
+    desc=ADXL345 Probe
+```
+
+Then restart Moonraker:
+
+```bash
+sudo systemctl restart moonraker
+```
+
+Notes:
+
+- `path` is the git clone from [Installation](#installation), **not** the
+  symlink in `klippy/extras`. Updating the clone updates the installed module,
+  because `install.sh` symlinks rather than copies.
+- `managed_services: klipper` restarts Klipper after an update, which is
+  required for the new module to be loaded.
+- No `install_script` is needed. The symlink survives a `git pull`, so running
+  `install.sh` again would only re-create it and issue a redundant second
+  Klipper restart. Add `install_script: scripts/install.sh` only if you have
+  moved or removed the symlink.
+- Moonraker will not manage a repository that isn't pristine. Commit and push
+  local edits, keep the working tree clean, and stay on a branch that exists on
+  `origin` — a detached HEAD or a local-only branch shows up in the UI as an
+  invalid repo offering only a hard recovery.
+- If you track your own fork, `origin` and `primary_branch` must match it.
+
 ## Klipper compatibility
 
 Klipper's `probe.py` has been through two API changes. This fork targets the
