@@ -191,7 +191,7 @@ Standard Klipper probe parameters, handled by `probe.ProbeParameterHelper`.
 
 | Parameter | Default | Description |
 | --------- | ------- | ----------- |
-| `disable_fans` | empty | Comma-separated list of fan object names (e.g. `fan_generic toolhead_fan`) to switch off during a probe session and restore afterwards. Fan vibration is a common source of false taps. |
+| `disable_fans` | empty | Comma-separated list of fans to switch off for the duration of a probe session and restore afterwards. Fan vibration is a common source of false taps. See [Disabling fans](#disabling-fans). |
 | `activate_gcode` | empty | G-code template run before each probing move. |
 | `deactivate_gcode` | empty | G-code template run after each probing move. |
 
@@ -200,6 +200,7 @@ Standard Klipper probe parameters, handled by `probe.ProbeParameterHelper`.
 | Command | Description |
 | ------- | ----------- |
 | `SET_ACCEL_PROBE [TAP_THRESH=<mm/s²>] [TAP_DUR=<s>] [ACCEL=<mm/s²>]` | Adjust tap threshold, tap duration and probing acceleration at runtime and echo the resulting values. Not saved — put the final numbers in the config. |
+| `TEST_TAP_TUNE [X=] [Y=] [Z=] [SPEED_START=] [SPEED_END=] [SPEED_STEP=] [THRESSHOLD_START=] [THRESSHOLD_END=] [TRIALS=] [SAMPLES=] [MARGIN=] [WINDOW=] [SAVE=<0\|1>]` | Home if needed, move to the middle of the bed, and find the best `speed` and `tap_thresh` pair. See [Tuning speed and tap_thresh automatically](#tuning-speed-and-tap_thresh-automatically). |
 | `PROBE` | Single probe at the current XY. |
 | `QUERY_PROBE` | Report the current state of the probe pin. Should read `open` with the nozzle in free air. |
 | `PROBE_ACCURACY` | Repeat-probe at the current XY and report the spread. |
@@ -230,6 +231,10 @@ sensitivity to the actual bed contact. Raise `tap_thresh` only if lowering
 acceleration is not enough. Note the 612.9 mm/s² register granularity: changes
 smaller than that do nothing.
 
+Once `probe_accel` is settled, `TEST_TAP_TUNE` finds `speed` and `tap_thresh`
+for you — see
+[Tuning speed and tap_thresh automatically](#tuning-speed-and-tap_thresh-automatically).
+
 **4. Check repeatability.** `PROBE_ACCURACY` with `samples: 10`. A well-tuned
 setup gives a range under 0.01 mm. If it drifts in one direction across
 samples, the bed or gantry is deflecting and you need a lower `tap_thresh`
@@ -240,6 +245,216 @@ samples, the bed or gantry is deflecting and you need a lower `tap_thresh`
 **6. Speed it up.** Reduce `rest_time` toward 0.03 and `sample_retract_dist`
 toward 1.0, re-running `PROBE_ACCURACY` after each change. Back off as soon as
 repeatability degrades.
+
+## Disabling fans
+
+Every fan is off for the whole probe session and restored when it ends:
+
+```ini
+[adxl345_probe]
+disable_fans: fan, hotend_fan, fan_generic toolhead_fan
+```
+
+Both naming styles work. `fan` is the part cooling fan (`[fan]`), and for a
+section with a name — `[heater_fan hotend_fan]` — you can write either the bare
+name `hotend_fan` or the full object name `heater_fan hotend_fan`. Use the full
+name if the bare one is ambiguous; the module says so at startup if it is.
+
+All fan types are supported: `[fan]`, `[fan_generic]`, `[heater_fan]`,
+`[controller_fan]` and `[temperature_fan]`. `heater_fan`, `controller_fan` and
+`temperature_fan` drive themselves from a periodic callback, so those are
+pinned off for the session rather than merely set to zero once — otherwise they
+would come back on a second later, in the middle of a probe. The fan's own
+`max_power` is held at zero for the same reason, which also covers a
+`[fan_generic]` being driven by `SET_FAN_SPEED TEMPLATE=...`, since a template
+re-evaluates every 0.5 s and no section-level setting stops it.
+
+The speed restored afterwards is the one that was *requested*, including a
+request still queued when the probe started. Klipper reports fan speed
+post-scaling, so a `max_power: 0.6` fan would otherwise come back at 0.36, and
+lose another 40% on every probe after that.
+
+A name that matches nothing is a **startup** error listing the fans that do
+exist, rather than an exception in the middle of a probe.
+
+Fans are restored when the probe session ends — including when it ends badly.
+Klipper's `PROBE` and `PROBE_ACCURACY` only call `end_probe_session()` on the
+success path and rely on the `gcode:command_error` event otherwise, so this
+module hooks that event as well; a misfired probe puts the fans back rather
+than leaving them off until the next successful one. A failure *inside* session
+startup, which the probe helper never sees, restores them too.
+
+Note that a hotend fan being off means the hotend is unattended while hot.
+Probe sessions are short, but do not run a `PROBE_ACCURACY` with hundreds of
+samples at printing temperature with the hotend fan disabled.
+
+## Tuning speed and tap_thresh automatically
+
+`speed` and `tap_thresh` are not independent. A faster probe hits the bed
+harder, so it takes a higher threshold before the move's own acceleration stops
+tripping the tap — and a threshold that works at 2 mm/s may miss the bed
+entirely at 8. `TEST_TAP_TUNE` sweeps the speeds you give it, finds the working
+`tap_thresh` band at each one, and scores the pairs by how repeatable the
+resulting probe actually is.
+
+```
+TEST_TAP_TUNE
+```
+
+That is the whole thing. It homes if any axis is unhomed, lifts clear, travels
+to the middle of the bed and probes from `Z=10` — no `G28`/`G1` preamble. Pass
+`X=`, `Y=` or `Z=` to override any of that.
+
+It refuses to start while a print is running or paused — see
+[Running during a print](#running-during-a-print).
+
+Read this before running it:
+
+- **This takes a while.** The defaults are ten speeds, roughly 300–500 probes,
+  40–80 minutes. The command prints its own estimate before starting. Narrow
+  `SPEED_START`/`SPEED_END` or raise `SPEED_STEP` to cut it down — a first pass
+  with `SPEED_STEP=4` halves it and still shows you which end of the range is
+  worth looking at.
+- **Home first and stand over the machine.** A probe at a threshold that is too
+  high does not stop at the bed; the nozzle drives down to `position_min` /
+  `minimum_z_position`. The search deliberately starts at the insensitive end,
+  which is where that happens. Keep a hand on the emergency stop, and consider
+  a first run with a low `THRESSHOLD_END`.
+- Tune `probe_accel` and `rest_time` **before** running it. The result is only
+  valid for the settings in force during the search.
+- Run it over the part of the bed you actually probe. The middle is the usual
+  answer, which is why it is the default, but a bed that flexes differently at
+  the edges can want a different threshold there.
+- **Homing uses the current `tap_thresh`.** If the probe is so badly tuned that
+  `G28` itself fails, the command cannot get started. Raise the threshold by
+  hand first with `SET_ACCEL_PROBE TAP_THRESH=...`, or home once with a Z
+  endstop, then run this.
+- The bed gets tapped several hundred times. Use a spot you don't mind marking.
+- The top of the default range is fast for a nozzle tap. If the high speeds
+  come back unusable, that is the answer for your machine, not a fault — the
+  run skips them and carries on.
+
+### Parameters
+
+| Parameter | Default | Description |
+| --------- | ------- | ----------- |
+| `X` | middle of the bed | Where to probe. The default is the midpoint of the travel the kinematics report, less `x_offset`. |
+| `Y` | middle of the bed | As `X`, less `y_offset`. |
+| `Z` | `10` | Height each probe starts its descent from. Must clear anything on the bed. |
+| `TRAVEL_SPEED` | `50` | mm/s for the move to the probing point. Not the probing speed — that is what the command is measuring. |
+| `SPEED_START` | `2` | First probing speed in mm/s. |
+| `SPEED_END` | `20` | Last probing speed in mm/s. |
+| `SPEED_STEP` | `2` | Increment. The defaults test 2, 4, 6, … 20 mm/s — ten speeds. Capped at 20 speeds per run. |
+| `THRESSHOLD_START` | `10000` | Bottom of the `tap_thresh` search range in mm/s². Also accepted as `THRESHOLD_START`. |
+| `THRESSHOLD_END` | `100000` | Top of the `tap_thresh` search range in mm/s². Also accepted as `THRESHOLD_END`. |
+| `TRIALS` | `3` | Probes per threshold candidate during the band search. A candidate must pass all of them. Raise it if your misfires are intermittent. |
+| `SAMPLES` | `10` | Probes used to score each speed's repeatability, once its threshold is chosen. This is the number the ranking is built on — don't set it below about 5. |
+| `MARGIN` | `2` | Register steps (612.9 mm/s² each) added to the bottom of each band for headroom. `MARGIN=0` uses the bare edge. |
+| `WINDOW` | `16` | Register steps searched either side of the previous speed's band before falling back to the full range. `WINDOW=255` disables the narrowing. |
+| `SAVE` | `1` | `1` writes `speed` and `tap_thresh` to the config and runs `SAVE_CONFIG`, which **restarts Klipper**. `0` applies them for this session and writes nothing — the lines to paste are printed either way. |
+| `CHIP` | — | Accelerometer name, matching `chip:`. Optional; only useful if you have named your `[adxl345]` section. |
+
+### How it works
+
+For each speed in turn:
+
+**1. Find the band.** The chip stores the threshold in an 8-bit register at
+612.9 mm/s² per step, so the search runs over register steps rather than raw
+mm/s² — the default range is 147 of them. Both ends of the working band are
+found by bisection, about 8–9 candidates instead of 147. Each candidate ends
+one of three ways:
+
+| Result | Meaning |
+| ------ | ------- |
+| `pass` | Descended past `min_probe_travel` and triggered. |
+| `sensitive` | Misfired: the tap latched while arming, or fired on the start-of-move acceleration. Threshold too low. |
+| `deaf` | Ran the whole move without triggering. Threshold too high. |
+
+The top of the band is found first — if `THRESSHOLD_END` is `deaf`, by
+bisecting for the lowest `deaf` value and taking the step below it. Then the
+bottom is bisected between `THRESSHOLD_START` and that top. The running best
+only ever moves to a value that has been verified passing, so a stray result
+cannot produce a recommendation that was never tested.
+
+**2. Score it.** The candidate is the bottom of the band plus `MARGIN` steps,
+capped at the top of the band. `SAMPLES` probes run at that value and the Z
+spread is recorded, the same measurement `PROBE_ACCURACY` reports.
+
+**3. Carry the window.** The next speed searches `WINDOW` register steps either
+side of this band rather than the whole range — the band moves with speed, but
+not usually far. If the band turns out to touch the edge of that window, or
+isn't in it at all, the search widens back out, so the narrowing costs accuracy
+nowhere; it only saves probes when the guess was good.
+
+A speed with no usable band at all is reported and skipped, not treated as
+fatal. The run only fails if *no* speed works.
+
+Finally the pairs are ranked by Z spread, ties broken by the wider band — the
+pair with the most room before it starts misfiring. The winner's `speed` and
+`tap_thresh` are applied, and saved if `SAVE=1`. The value written for
+`tap_thresh` is the smallest whole mm/s² that maps back onto the winning
+register, so what is written reproduces exactly what was tested.
+
+Only `pass`, `sensitive` and `deaf` are verdicts. Anything else — an SPI
+readback mismatch, an MCU homing timeout, a printer shutdown, a move out of
+range — aborts the run and reports itself, rather than being recorded as "this
+threshold misfires" and sending you off tuning the wrong thing.
+
+Bisection assumes misfiring is monotonic in the threshold, which tap detection
+only roughly is. Confirm the winner with `PROBE_ACCURACY` before trusting it.
+
+### Running during a print
+
+`TEST_TAP_TUNE` homes the toolhead, drives to the middle of the bed and taps it
+a few hundred times. Doing that partway through a print would destroy it, so
+the command checks first and refuses:
+
+```
+!! TEST_TAP_TUNE: not starting - a print job is printing. This command homes
+the toolhead, drives to the middle of the bed and taps it a few hundred times,
+which would wreck the print. Run it when the printer is idle. Nothing has been
+changed.
+```
+
+It refuses by **returning**, not by raising an error. An error raised inside an
+SD print makes Klipper break out of the print loop and stop the job — which is
+the outcome the check exists to prevent. So a stray `TEST_TAP_TUNE` in a macro
+or a queued console command warns and does nothing; the print carries on.
+
+A job is considered active when `[print_stats]` reports `printing` or `paused`,
+or when `[virtual_sdcard]` is streaming a file. `paused` counts: the part is
+still on the bed. `complete`, `cancelled` and `standby` do not.
+
+One limitation worth knowing: a job streamed line by line over the serial port
+by a host that drives neither of those objects cannot be detected from inside
+Klipper, and the check will not catch it.
+
+### Reading the output
+
+```
+  speed   4.0  tap_thresh  17162 (reg  28): band reg 26-50 (24 steps), 10 samples, range 0.0042 sigma 0.0015
+TEST_TAP_TUNE: results, best first
+  1. speed   4.0  tap_thresh  17162  range 0.0042  sigma 0.0015  band 24 steps
+  2. speed   6.0  tap_thresh  22065  range 0.0121  sigma 0.0044  band 28 steps
+```
+
+A wide band means the setup has room to spare at that speed. A narrow one — a
+handful of register steps — means it is close to having no working threshold at
+all, and small changes (a different bed spot, a warmer chamber) may break it.
+Lower `probe_accel` to widen the bands.
+
+### Failure messages
+
+| Message | Meaning |
+| ------- | ------- |
+| `no speed produced a usable tap_thresh` | No speed had a working band. `probe_accel` is too high, or something is vibrating — a fan (see `disable_fans`), or a stepper. Check the pin with `QUERY_PROBE` first. |
+| `speed N: unusable - tap_thresh M (the top of the range) still misfires` | At this speed even the least sensitive setting misfires. Skipped. |
+| `speed N: unusable - nothing in ... detected the bed` | At this speed nothing in the range felt the contact. Try a lower `THRESSHOLD_START` or a higher speed. |
+| `speed N: unusable - M already misfires and P ... misses the bed` | The misfire threshold and the deaf threshold meet with no gap. Lower `probe_accel` to open one up. |
+| `failed the repeatability run` | The chosen threshold passed the trials but not the longer `SAMPLES` run. Results at that speed are marginal; raise `TRIALS` or `MARGIN`. |
+
+An aborted run restores the previous `tap_thresh`, lifts back to the height it
+started from, and writes nothing to the config.
 
 ## Delta printers
 
@@ -280,7 +495,11 @@ minimum_z_position: -2
 | `AttributeError: module 'extras.probe' has no attribute 'ProbeParameterHelper'` | Module too new for your Klipper — use upstream, or update Klipper. |
 | `ADXL345 probe pin reads TRIGGERED while the tap register is clear` | `probe_pin` polarity. Remove a `^` pullup, or add `!` if the interrupt idles high. |
 | `ADXL345 tap triggered before move, it may be set too sensitive.` | The tap latched while arming. Raise `tap_thresh`, raise `rest_time`, or check for fan/motor vibration. |
-| `ADXL345 probe triggered after only N mm of travel` | False trigger on the start-of-move acceleration. Lower `probe_accel`, then raise `tap_thresh`. |
+| `ADXL345 probe triggered after only N mm of travel` | False trigger on the start-of-move acceleration. Lower `probe_accel`, then raise `tap_thresh` — or let `TEST_TAP_TUNE` find it. |
+| `TEST_TAP_TUNE: G28 did not home X, Y and Z` | The command homed for you, but an axis is still unhomed afterwards. Usually a failed Z home — fix that first. |
+| `the kinematics do not report a travel range` | The middle of the bed cannot be worked out for this kinematics. Pass `X=` and `Y=` explicitly. |
+| `AttributeError: 'PrinterFan' object has no attribute 'fan_speed'` | Old version of this module: it assumed every fan section had a `fan_speed` attribute, which `[fan]` and `[fan_generic]` do not. Update — see [Disabling fans](#disabling-fans). |
+| `disable_fans: no fan named 'x'` | Typo, or the fan is a named section. Both `hotend_fan` and `heater_fan hotend_fan` are accepted; the message lists the fans that exist. |
 | `Move out of range` right after a probe | The trigger happened with no headroom for the retract. Set `min_probe_travel` above 0 to get the real error, and probe from a lower Z. |
 | `Failed to set ADXL345 register [0x..] to 0x..: got 0x..` | SPI communication problem — wiring, bus contention, or too high an SPI speed. Klipper's `adxl345.set_reg()` verifies every write, so this is a genuine bus fault, not a tuning issue. |
 
