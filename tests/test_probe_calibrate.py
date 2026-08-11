@@ -120,7 +120,8 @@ class DescendHelper:
         if code > deaf:
             th.pos[2] = sim.z_min
             raise CommandError("No trigger on probe after full movement")
-        th.pos[2] = sim.trigger(speed) + sim.jitter(speed)
+        th.pos[2] = sim.deep_codes.get(code, sim.trigger(speed)) \
+            + sim.jitter(speed)
         self.results.append(list(th.pos))
 
 
@@ -347,6 +348,8 @@ class Sim:
         # A register that taps once and misfires from then on
         self.flaky_code = None
         self.flaky_taps = 0
+        # register -> trigger height, for thresholds latching far from it
+        self.deep_codes = {}
         self.fault = None
         self.fault_after = 3
         self.homing_calls = 0
@@ -917,6 +920,80 @@ speed_case("no speed works",
            {2.0: (200, 100), 4.0: (200, 100), 6.0: (200, 100),
             8.0: (200, 100)}, {}, None,
            expect_error="no speed produced a usable tap_thresh")
+
+
+def negative_trigger_case():
+    """Contact below nominal zero is the normal case for a nozzle probe, so the
+    trigger heights come back negative. Accuracy is the distance from zero, so
+    the pair that pressed in least still wins - ranking on the signed value
+    would pick the one that pressed hardest."""
+    import extras.adxl345_probe as mod
+    sim = Sim(60, 200, bands={10.: (20, 60), 12.: (20, 60), 14.: (20, 60)})
+    # 12 mm/s triggers closest to the bed; 14 drives deepest past it
+    sim.trigger_heights = {10.: -0.0197, 12.: -0.0120, 14.: -0.0350}
+    wrapper = build(sim, mod)
+    log = []
+    gcmd = GCmd({'SPEED_START': 10, 'SPEED_END': 14, 'SPEED_STEP': 2,
+                 'SAMPLES': 4, 'DEVIATION': 0}, log, quiet=True)
+    print("\n=== accuracy: trigger heights below nominal zero ===")
+    wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
+    for ln in log:
+        if ln.startswith("  1.") or ln.startswith("  3."):
+            print("  %s" % ln.strip())
+    # Reported accuracy is never negative
+    for ln in log:
+        if 'accuracy' in ln:
+            value = ln.split('accuracy')[1].split()[0]
+            assert not value.startswith('-'), "negative accuracy: %s" % ln
+    got_speed = float(sim.configfile.saved[('adxl345_probe', 'speed')])
+    assert got_speed == 12., \
+        "picked speed %g, expected 12 - the shallowest" % got_speed
+    # and the signed average is still reported, so the sign is not lost
+    assert any('average z -0.0120' in ln for ln in log), \
+        "the signed trigger height was not reported"
+    print("  -> picked the shallowest, ok")
+
+
+negative_trigger_case()
+
+
+def accuracy_ceiling_case():
+    """An accuracy worse than ACCURACY_MAX is not a measurement of the bed, so
+    the threshold that produced it is treated as unusable and the walk carries
+    on up. The next threshold that measures sanely is the one kept."""
+    import extras.adxl345_probe as mod
+    print("\n=== accuracy: worse than the 0.1 mm ceiling ===")
+    sim = Sim(20, 200)
+    # Registers 20-24 trigger far from the bed - deflection, or the tap
+    # latching on something that is not the contact. 25 upwards is sane.
+    sim.deep_codes = {20: -0.35, 21: -0.30, 22: -0.25, 23: -0.20, 24: -0.15}
+    wrapper = build(sim, mod)
+    log = []
+    gcmd = GCmd({'SPEED_START': 5, 'SPEED_END': 5, 'SPEED_STEP': 1,
+                 'SAMPLES': 4, 'DEVIATION': 0}, log, quiet=True)
+    wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
+    rejected = [ln for ln in log if 'worse than' in ln]
+    for ln in rejected:
+        print("  %s" % ln.strip())
+    assert len(rejected) == 5, \
+        "%d thresholds rejected, expected 5" % len(rejected)
+    assert sim.chip.regs[0x1D] == 25, \
+        "kept reg %d, expected 25" % sim.chip.regs[0x1D]
+    print("  -> walked past all five, kept reg %d" % sim.chip.regs[0x1D])
+    # And with the ceiling raised, the first one is good enough
+    sim2 = Sim(20, 200)
+    sim2.deep_codes = dict(sim.deep_codes)
+    wrapper2 = build(sim2, mod)
+    gcmd2 = GCmd({'SPEED_START': 5, 'SPEED_END': 5, 'SPEED_STEP': 1,
+                  'SAMPLES': 4, 'DEVIATION': 0, 'ACCURACY_MAX': 0.5}, [],
+                 quiet=True)
+    wrapper2.cmd_ADXL_PROBE_CALIBRATE(gcmd2)
+    assert sim2.chip.regs[0x1D] == 20, \
+        "ACCURACY_MAX=0.5 kept reg %d, expected 20" % sim2.chip.regs[0x1D]
+    print("  -> ACCURACY_MAX=0.5 accepts reg 20, ok")
+
+
+accuracy_ceiling_case()
 
 
 def accuracy_spot_case():

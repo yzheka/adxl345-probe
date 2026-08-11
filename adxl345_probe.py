@@ -72,6 +72,10 @@ CAL_SPEED_END = 30.
 CAL_SPEED_STEP = 2.
 CAL_MAX_SPEEDS = 20
 CAL_SAMPLES = 10  # taps per accuracy measurement
+# An average trigger height further than this from nominal zero is not a
+# measurement of the bed, so the threshold that produced it is treated as
+# unusable and the walk carries on up.
+CAL_ACCURACY_MAX = 0.1
 # The nozzle rises this far between those taps, and the descent that follows
 # has to be longer than min_probe_travel or the trigger counts as a misfire.
 # Twice that is the default, and this is the floor when it is 0.
@@ -632,7 +636,7 @@ class ADXL345EndstopWrapper:
     # one probe, no bed contact - so walking up from the sensitive end is what
     # keeps the bed intact. Returns the accuracy measurement for this speed.
     def _measure_speed(self, gcmd, probe_gcmd, speed, thresholds, samples,
-                       lift, start_z, lift_speed):
+                       lift, worst, start_z, lift_speed):
         probed = []
         for thresh in thresholds:
             if self._tap_code(thresh) <= TAP_GRAVITY_CODE:
@@ -698,15 +702,30 @@ class ADXL345EndstopWrapper:
                     gcmd.respond_info(
                         "  tap %-4s speed %5.1f  tap_thresh %6.0f  accuracy"
                         " %.4f" % ("#%d:" % (n,), speed, thresh,
-                                   sum(zs) / len(zs)))
+                                   abs(sum(zs) / len(zs))))
             if failed is None and len(zs) >= 2:
                 mean = sum(zs) / len(zs)
                 spread = max(zs) - min(zs)
                 sigma = math.sqrt(sum((v - mean) ** 2 for v in zs)
                                   / len(zs))
                 self._lift_to(start_z, lift_speed)
+                if abs(mean) > worst:
+                    # Triggering that far from the bed is not a measurement of
+                    # anything: the tap is latching on something other than the
+                    # contact, or the effector is deflecting that far
+                    # before the chip sees it. Treat it like any other
+                    # unusable threshold.
+                    gcmd.respond_info(
+                        "  speed %5.1f  tap_thresh %6.0f  accuracy %.4f is"
+                        " worse than %.4f - raising tap_thresh"
+                        % (speed, thresh, abs(mean), worst))
+                    continue
+                # The trigger height is signed - it is a toolhead position, and
+                # contact below nominal zero is the normal case. What ranks the
+                # pairs is its distance from zero, so keep both.
                 return {'speed': speed, 'thresh': thresh, 'mean': mean,
-                        'spread': spread, 'sigma': sigma, 'samples': len(zs)}
+                        'accuracy': abs(mean), 'spread': spread,
+                        'sigma': sigma, 'samples': len(zs)}
             # The accuracy run broke down, so this threshold only works
             # intermittently. Carry on up.
             self._lift_to(start_z, lift_speed)
@@ -738,6 +757,7 @@ class ADXL345EndstopWrapper:
         thresholds = self._thresholds(gcmd)
         speeds = self._speeds(gcmd)
         samples = gcmd.get_int('SAMPLES', CAL_SAMPLES, minval=2, maxval=100)
+        worst = gcmd.get_float('ACCURACY_MAX', CAL_ACCURACY_MAX, above=0.)
         lift = gcmd.get_float('LIFT', max(2. * self.min_probe_travel,
                                           CAL_LIFT_FLOOR), above=0.)
         if lift <= self.min_probe_travel:
@@ -783,7 +803,7 @@ class ADXL345EndstopWrapper:
                 try:
                     measured.append(self._measure_speed(
                         gcmd, probe_gcmd, speed, thresholds, samples, lift,
-                        start_z, lift_speed))
+                        worst, start_z, lift_speed))
                 except self.NoThreshold as e:
                     gcmd.respond_info("  speed %5.1f: unusable - %s"
                                       % (speed, e))
@@ -793,9 +813,11 @@ class ADXL345EndstopWrapper:
                     " tap_thresh. Lower probe_accel, check the wiring with"
                     " QUERY_PROBE, and confirm the probe triggers when you tap"
                     " the nozzle by hand during a PROBE.")
-            # Lowest average trigger height wins - the pair that felt the bed
-            # with the least travel past it. The spread breaks ties.
-            measured.sort(key=lambda r: (round(r['mean'], 4), r['spread']))
+            # The pair whose average trigger height sits closest to nominal
+            # zero wins - the one that felt the bed with the least travel
+            # past it. The spread breaks ties.
+            measured.sort(key=lambda r: (round(r['accuracy'], 4),
+                                         r['spread']))
             best = measured[0]
             self.tap_thresh = best['thresh']
             self._write_tap_regs()
@@ -806,10 +828,10 @@ class ADXL345EndstopWrapper:
             gcmd.respond_info("ADXL_PROBE_CALIBRATE: results, best first")
             for rank, r in enumerate(measured):
                 gcmd.respond_info(
-                    "  %d. speed %5.1f  tap_thresh %6.0f  average z %.4f"
-                    "  range %.4f  sigma %.4f  (%d taps)"
-                    % (rank + 1, r['speed'], r['thresh'], r['mean'],
-                       r['spread'], r['sigma'], r['samples']))
+                    "  %d. speed %5.1f  tap_thresh %6.0f  accuracy %.4f"
+                    "  (average z %+.4f)  range %.4f  sigma %.4f  (%d taps)"
+                    % (rank + 1, r['speed'], r['thresh'], r['accuracy'],
+                       r['mean'], r['spread'], r['sigma'], r['samples']))
         finally:
             self.managed_session = False
             self.cal_point = None
@@ -831,13 +853,14 @@ class ADXL345EndstopWrapper:
                        "%.0f" % (self.tap_thresh,))
         configfile.set(self.config_name, 'speed', "%g" % (best['speed'],))
         gcmd.respond_info(
-            "ADXL_PROBE_CALIBRATE: lowest average trigger height was %.4f mm"
-            " (range %.4f) at speed %g with tap_thresh %.0f. Both are applied"
-            " now and staged for [%s]:\n"
+            "ADXL_PROBE_CALIBRATE: best accuracy was %.4f mm (average trigger"
+            " height %+.4f, range %.4f) at speed %g with tap_thresh %.0f. Both"
+            " are applied now and staged for [%s]:\n"
             "speed: %g\ntap_thresh: %.0f\n"
             "Run SAVE_CONFIG to keep them - it restarts Klipper."
-            % (best['mean'], best['spread'], best['speed'], self.tap_thresh,
-               self.config_name, best['speed'], self.tap_thresh))
+            % (best['accuracy'], best['mean'], best['spread'], best['speed'],
+               self.tap_thresh, self.config_name, best['speed'],
+               self.tap_thresh))
 
     # A print job in progress means the bed is occupied and the toolhead is
     # part way through someone's work. print_stats covers Moonraker-driven

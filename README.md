@@ -236,7 +236,7 @@ Standard Klipper probe parameters, handled by `probe.ProbeParameterHelper`.
 | Command | Description |
 | ------- | ----------- |
 | `SET_ACCEL_PROBE [TAP_THRESH=<mm/s²>] [TAP_DUR=<s>] [ACCEL=<mm/s²>]` | Adjust tap threshold, tap duration and probing acceleration at runtime and echo the resulting values. Not saved — put the final numbers in the config. |
-| `ADXL_PROBE_CALIBRATE [X=] [Y=] [Z=] [DEVIATION=] [SPEED_START=] [SPEED_END=] [SPEED_STEP=] [THRESHOLD_START=] [THRESHOLD_END=] [THRESHOLD_STEP=] [SAMPLES=] [LIFT=] [TRAVEL_SPEED=]` | Home if needed, move to the middle of the bed, and find the `speed` and `tap_thresh` pair that probes most accurately. Applies them and stages them for `SAVE_CONFIG`. See [Calibrating speed and tap_thresh automatically](#calibrating-speed-and-tap_thresh-automatically). |
+| `ADXL_PROBE_CALIBRATE [X=] [Y=] [Z=] [DEVIATION=] [SPEED_START=] [SPEED_END=] [SPEED_STEP=] [THRESHOLD_START=] [THRESHOLD_END=] [THRESHOLD_STEP=] [SAMPLES=] [LIFT=] [ACCURACY_MAX=] [TRAVEL_SPEED=]` | Home if needed, move to the middle of the bed, and find the `speed` and `tap_thresh` pair that probes most accurately. Applies them and stages them for `SAVE_CONFIG`. See [Calibrating speed and tap_thresh automatically](#calibrating-speed-and-tap_thresh-automatically). |
 | `PROBE` | Single probe at the current XY. |
 | `QUERY_PROBE` | Report the current state of the probe pin. Should read `open` with the nozzle in free air. |
 | `PROBE_ACCURACY` | Repeat-probe at the current XY and report the spread. |
@@ -370,10 +370,19 @@ step. A `deaf` result ends the speed — nothing higher can be more sensitive.
 the measurement — the point is to measure the probe, and moving between taps
 would fold the shape of the bed into the result.
 
-The **average trigger height** of those taps is the accuracy for that pair. It
-is how far past the surface the effector carried before the chip saw the
-contact, so a lower average is a probe that felt the bed sooner. The spread and
-sigma are reported alongside it.
+The **average trigger height** of those taps is the accuracy for that pair —
+strictly, its distance from nominal Z=0, since the trigger position itself is
+usually negative. Contact below zero is the normal case for a nozzle probe: the
+tap latches only after the effector has pressed in far enough for the chip to
+see it, so the reported position sits below the nominal plane. A smaller
+distance is a probe that felt the bed sooner, with less deflection.
+
+An accuracy worse than `ACCURACY_MAX` (0.1 mm) is not a measurement of the bed
+at all — the tap is latching on something other than the contact, or the
+effector is deflecting that far first. That threshold is treated as unusable and
+the walk carries on upward, exactly as it does for a misfire.
+
+The spread and sigma are reported alongside the average.
 
 The tap that found the threshold is not counted: it descended from `Z` rather
 than from `LIFT`, so it is not the same measurement.
@@ -385,8 +394,8 @@ intermittently: the walk carries on upward instead of giving up on the speed.
 `THRESHOLD_START`, so a band that moves — in either direction — is always
 found.
 
-The pairs are then ranked by average trigger height, lowest first, ties broken
-by the smaller spread. The winner is applied immediately and staged for
+The pairs are then ranked by accuracy — distance from zero, closest first —
+ties broken by the smaller spread. The winner is applied immediately and staged for
 `SAVE_CONFIG`, which the command does **not** run for you:
 
 ```
@@ -418,6 +427,7 @@ and stages nothing.
 | `Y` | middle of the bed | As `X`, less `y_offset`. |
 | `DEVIATION` | `20` | Half-width in mm of the square around `X`/`Y` that the **walk's** taps are scattered over, so the climb does not dent one spot. Each tap of the walk picks a fresh random point in `X±dev`, `Y±dev`. The accuracy measurement never moves, whatever this is set to. `0` puts everything on the same spot. |
 | `SAMPLES` | `10` | Taps per accuracy measurement. This is the number the ranking is built on — don't set it below about 5. |
+| `ACCURACY_MAX` | `0.1` | Worst accuracy in mm that counts as a measurement. Beyond that the threshold is treated as unusable and the walk carries on up, the same as for a misfire. |
 | `LIFT` | 2 × `min_probe_travel` | How far the nozzle rises between those taps, in mm, and therefore how far the next one descends. Must be above `min_probe_travel`, or every tap would trigger inside it and be read as a misfire — so the default is twice it, and the command refuses to start if you pass less. Never below 1 mm, for a `min_probe_travel` of 0. |
 | `Z` | `10` | Height the first tap at each threshold descends from. Must clear anything on the bed. The move to the probing point also happens at this height — on a delta the reachable radius near the top of the travel is nil, so traversing at the height `G28` finishes at is out of range. |
 | `TRAVEL_SPEED` | `50` | mm/s for the moves to the probing point. Not the probing speed — that is what the command is measuring. |
@@ -556,23 +566,26 @@ recomputed as it settles.
 ```
 ADXL_PROBE_CALIBRATE: probing at X0.000 Y0.000 from Z10.000, climbing over X-20.000-20.000 Y-20.000-20.000
 ADXL_PROBE_CALIBRATE: speeds 10, 12 mm/s, tap_thresh 10000 - 100000 mm/s^2 in 91 step(s) (the first 1 are at or below 1g and are skipped), 10 taps per measurement. ...
-  tap #1:  speed  10.0  tap_thresh  25000  tapped at z 0.0187
+  tap #1:  speed  10.0  tap_thresh  25000  tapped at z -0.0187
   tap #2:  speed  10.0  tap_thresh  25000  accuracy 0.0193
   tap #3:  speed  10.0  tap_thresh  25000  accuracy 0.0182
   tap #4:  speed  10.0  tap_thresh  25000  accuracy 0.0180
   ...
   tap #10: speed  10.0  tap_thresh  25000  accuracy 0.0183
-  tap #1:  speed  12.0  tap_thresh  27000  tapped at z 0.0211
+  tap #1:  speed  12.0  tap_thresh  27000  tapped at z -0.0211
   ...
 ADXL_PROBE_CALIBRATE: results, best first
-  1. speed  10.0  tap_thresh  25000  average z 0.0183  range 0.0040  sigma 0.0015  (10 taps)
-  2. speed  12.0  tap_thresh  27000  average z 0.0218  range 0.0040  sigma 0.0014  (10 taps)
+  1. speed  10.0  tap_thresh  25000  accuracy 0.0183  (average z -0.0183)  range 0.0040  sigma 0.0015  (10 taps)
+  2. speed  12.0  tap_thresh  27000  accuracy 0.0218  (average z -0.0218)  range 0.0040  sigma 0.0014  (10 taps)
 ```
 
 `tap #1` reports the height it triggered at, because one tap is not an accuracy
-yet. From `tap #2` on, each line is the average of every tap so far at that
-threshold and speed, so you can watch it converge — and see immediately if it
-does not. The last one is the figure the speeds are ranked by.
+yet — and it is signed, because it is a toolhead position, and contact below
+nominal zero is normal. From `tap #2` on, each line is the average distance from
+zero over every tap so far at that threshold and speed, so you can watch it
+converge — and see immediately if it does not. The last one is the figure the
+speeds are ranked by. The results table shows the signed average next to it, so
+the sign is not lost.
 
 The results table adds `range` and `sigma` per pair. They are worth a look
 before trusting the ranking: a range much larger than the differences between
@@ -593,7 +606,8 @@ no threshold in the range worked there, the run says so and carries on.
 | `speed N: unusable - the most sensitive usable tap_thresh (M) did not feel the bed at all` | Not a threshold problem: nothing above M can be more sensitive. Check the pin with `QUERY_PROBE`, check `tap_dur` is long enough for the contact, and confirm a hand tap on the nozzle stops a `PROBE`. |
 | `speed N: unusable - tap_thresh M already misses the bed` | The band ended below where the walk reached. Usually means the previous speed's band was much lower. |
 | `speed N: unusable - tap_thresh M misses the bed part way through the accuracy run` | It tapped once, then stopped feeling the bed. Usually a bed that is deflecting under repeated contact. |
-| `only N of M taps worked (...) - raising tap_thresh` | Not a failure: that threshold is marginal, and the walk is carrying on upward. |
+| `only N of M taps worked - raising tap_thresh` | Not a failure: that threshold is marginal, and the walk is carrying on upward. |
+| `accuracy X is worse than Y - raising tap_thresh` | The taps triggered further than `ACCURACY_MAX` from zero, so they measured deflection rather than the bed. Also not fatal — the walk carries on up. |
 | `LIFT=x is not above min_probe_travel=y` | The accuracy taps would trigger inside `min_probe_travel` and be read as misfires. Leave `LIFT` out and it defaults to twice `min_probe_travel`. |
 
 ### Running during a print
