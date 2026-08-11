@@ -640,9 +640,11 @@ session_case("failure inside start_probe_session", break_startup=True)
 
 def search_property_test(margin=2):
     """For every reachable (misfire edge, deaf edge) pair, the command must
-    either find the true lowest working register + margin, or fail with the
-    error that matches the band it was given. The old phase-1 walk-down
-    silently skipped narrow working bands, so this sweeps all of them."""
+    land on the true lowest working register plus the margin, or fail with the
+    error that matches the band it was given. Narrow bands are the interesting
+    ones - the walk stops at the first success and adds the margin without
+    probing it, so a band narrower than the margin has to be caught by the
+    accuracy run and fall back to the bare edge."""
     import extras.adxl345_probe as mod
     lo, hi = 16, 163
     checked = failures = 0
@@ -673,7 +675,11 @@ def search_property_test(margin=2):
                 print("  MISMATCH s=%d d=%d: succeeded, band is empty"
                       % (sensitive, deaf))
                 continue
-            want = min(band_low + margin, band_high)
+            # The margin is added unprobed; if it lands past the top of the
+            # band the accuracy run fails and the edge itself is used
+            want = min(band_low + margin, hi)
+            if want > band_high:
+                want = band_low
             got = sim.chip.regs[0x1D]
             if got != want:
                 failures += 1

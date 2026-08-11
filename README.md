@@ -310,8 +310,8 @@ It refuses to start while a print is running or paused — see
 
 Read this before running it:
 
-- **This takes a while.** The defaults are eleven speeds, roughly 200–550
-  probes, 30–70 minutes. Most of them are misfires that never touch the bed —
+- **This takes a while.** The defaults are eleven speeds, roughly 120–450
+  probes, 20–60 minutes. Most of them are misfires that never touch the bed —
   see [Sparing the bed](#sparing-the-bed). The command prints its own estimate
   before starting.
   Narrow `SPEED_START`/`SPEED_END` or raise `SPEED_STEP` to cut it down — a
@@ -354,9 +354,9 @@ Read this before running it:
 | `THRESHOLD_START` | `10000` | Bottom of the `tap_thresh` search range in mm/s². The misspelling `THRESSHOLD_START` this command shipped with is still accepted. |
 | `THRESHOLD_END` | `100000` | Top of the `tap_thresh` search range in mm/s². The misspelling `THRESSHOLD_END` is still accepted. |
 | `THRESHOLD_STEP` | `1` | How much the walk raises `tap_thresh` after a misfire, in register steps (612.9 mm/s² each, like `MARGIN` and `WINDOW`). `1` tries every register and cannot miss a band. A bigger step gets to the band in fewer probes; if it lands past a narrow band, the registers it skipped are re-walked one at a time. |
-| `TRIALS` | `3` | Probes per threshold candidate during the band search. A candidate must pass all of them. Raise it if your misfires are intermittent. |
+| `TRIALS` | `1` | Probes at each candidate on the way up. `1` moves on at the first success, which is the point of walking upwards. Raise it only if your misfires are intermittent enough that one success can be luck — every extra probe here is another bed contact. |
 | `SAMPLES` | `10` | Probes used to score each speed's repeatability, once its threshold is chosen. This is the number the ranking is built on — don't set it below about 5. |
-| `MARGIN` | `2` | Register steps (612.9 mm/s² each) of headroom above the edge, each one verified by probing. The candidate is the highest of them that still passes, so `MARGIN` is a ceiling, not an assumption. `MARGIN=0` uses the bare edge and probes nothing extra. |
+| `MARGIN` | `2` | Register steps (612.9 mm/s² each) added to the edge for headroom, so the recommendation does not sit exactly where misfiring begins. Not probed beforehand — the accuracy run happens at edge + `MARGIN` and drops the margin if that value misses the bed. `MARGIN=0` uses the bare edge. |
 | `WINDOW` | `16` | Register steps below the previous speed's edge where the next speed starts walking, instead of at `THRESHOLD_START`. This is what keeps the run from re-walking the whole range at every speed. `WINDOW=255` effectively disables the shortcut. |
 | `SAVE` | `1` | `1` writes `speed` and `tap_thresh` to the config and runs `SAVE_CONFIG`, which **restarts Klipper**. `0` applies them for this session and writes nothing — the lines to paste are printed either way. |
 | `CHIP` | — | Accelerometer name, matching `chip:`. Optional; only useful if you have named your `[adxl345]` section. |
@@ -377,23 +377,25 @@ registers and probes again. Each attempt ends one of three ways:
 | `pass` | Descended past `min_probe_travel` and triggered. | A normal tap |
 | `deaf` | Ran the whole move without triggering. Threshold too high. | **Drives into the bed** and keeps pushing to the descent floor |
 
-The walk stops at the first `pass`, which is the bottom of the working band.
-Everything below it cost one misfire each and never touched the bed.
+The walk stops at the **first** `pass` — the bottom of the working band — and
+nothing above it is probed to see how much further the band goes. Finding the
+top of a band means probing until the bed is missed, and every `deaf` attempt
+drives the nozzle into the bed for the whole descent, which is the one thing
+worth avoiding. Everything below the edge cost one misfire each and never
+touched the bed.
 
-**2. Verify the margin.** From that edge the search steps up one register at a
-time, up to `MARGIN` steps, stopping at the last value that still passes. That
-value is the candidate.
+**2. Measure the accuracy there.** `MARGIN` register steps are added to the edge
+for headroom, and `SAMPLES` probes run at that value. The Z spread they produce
+is the same measurement `PROBE_ACCURACY` reports, and it is what the speeds are
+ranked by — so the accuracy is always measured at the exact `tap_thresh` being
+recommended.
 
-The top of the band is deliberately **not** measured. Finding it means probing
-until the bed is missed, and every `deaf` attempt drives the nozzle into the
-bed for the whole descent — which is the one thing worth avoiding. The
-consequence is that the reported headroom is "verified this far", not "the band
-ends here".
+The margin is added without being probed first. If it lands past the top of the
+band, the first probe of the accuracy run misses the bed, and the run drops the
+margin and re-measures at the bare edge. That costs one hard contact, and it
+only happens on a band narrower than `MARGIN` — `MARGIN=0` avoids it entirely.
 
-**3. Score it.** `SAMPLES` probes run at the candidate and the Z spread is
-recorded, the same measurement `PROBE_ACCURACY` reports.
-
-**4. Carry the floor.** The next speed starts its walk `WINDOW` registers below
+**3. Carry the floor.** The next speed starts its walk `WINDOW` registers below
 this speed's edge rather than at the bottom of the range — the band moves with
 speed, but not usually far, and the walk is where nearly all the probes go. If
 that floor turns out to be above the band, or the edge is found at the floor
@@ -423,17 +425,18 @@ Two things protect the bed, and they are independent.
 
 **The search direction.** Walking up from the sensitive end means a wrong
 threshold misfires in the first fraction of a millimetre instead of pressing the
-nozzle into the bed, and not measuring the top of the band means never
-deliberately probing until the bed is missed. On a simulated eleven-speed run
-whose band drifts with speed:
+nozzle into the bed. Stopping at the first success means never probing past the
+band to find out where it ends. On a simulated eleven-speed run whose band
+drifts with speed:
 
 | | Total probes | Misfires (no contact) | Taps | Drove into the bed |
 | --- | --- | --- | --- | --- |
 | Bisecting from `THRESHOLD_END` down | 385 | 26 | 341 | 18 |
-| Walking up from `THRESHOLD_START` | 478 | 269 | 209 | 0 |
+| Walking up, probing the whole band | 478 | 269 | 209 | 0 |
+| Walking up, stopping at the first success | 390 | 269 | **121** | **0** |
 
-More probes, but 209 taps instead of 341 and nothing driven into the bed. The
-extra probes are misfires, which cost a second each and never make contact.
+121 bed contacts instead of 341, and nothing driven into the bed. The misfires
+cost a second each and never make contact, so a longer walk is nearly free.
 
 **The spot.** The taps that do land still land in the same place by default, and
 on smooth PEI or glass that eventually shows. `TEST_TAP_DEVIATION` spreads them
@@ -489,24 +492,22 @@ Klipper, and the check will not catch it.
   speed  10.0  tap_thresh  10420 (reg  17): sensitive Probe triggered prior to movement
   ... one line per register step ...
   speed  10.0  tap_thresh  16549 (reg  27): sensitive Probe triggered prior to movement
-  speed  10.0  tap_thresh  17162 (reg  28): pass      z min 0.0193 max 0.0220 range 0.0027
-  speed  10.0  tap_thresh  17775 (reg  29): pass      z min 0.0180 max 0.0207 range 0.0027
-  speed  10.0  tap_thresh  18388 (reg  30): pass      z min 0.0180 max 0.0220 range 0.0040
-  speed  10.0  tap_thresh  18388 (reg  30): works from reg 28, +2 of 2 headroom, 10 samples, range 0.0040 sigma 0.0015
+  speed  10.0  tap_thresh  17162 (reg  28): pass      z min 0.0193 max 0.0193 range 0.0000
+  speed  10.0  tap_thresh  18388 (reg  30): works from reg 28, 10 samples, range 0.0040 sigma 0.0015
 TEST_TAP_TUNE: results, best first
   1. speed  10.0  tap_thresh  18388  range 0.0040  sigma 0.0015  works from reg 28
   2. speed  12.0  tap_thresh  22065  range 0.0120  sigma 0.0041  works from reg 34
 ```
 
 The `sensitive` lines are the walk climbing towards the band — each one is a
-probe that misfired without touching the bed. `works from reg N` is the lowest
-register that passed, and `+2 of 2 headroom` means both margin steps above it
-were probed and also passed.
+probe that misfired without touching the bed. The single `pass` after them is
+the first success, and the walk stops there: `works from reg 28`. The line after
+it is the accuracy run, 10 samples at reg 30 (28 plus the 2-step `MARGIN`),
+which is the pair being recommended.
 
-Headroom below the `MARGIN` asked for is the interesting case: it means the band
-ran out, so the setup is close to having no working threshold at that speed, and
-small changes (a different bed spot, a warmer chamber) may break it. Lower
-`probe_accel` to widen the bands.
+`range` is what the speeds are ranked by, `sigma` breaks ties. One tap ends the
+walk and ten measure the result, so a speed costs eleven bed contacts however
+far the walk had to climb.
 
 ### Failure messages
 
@@ -516,7 +517,8 @@ small changes (a different bed spot, a warmer chamber) may break it. Lower
 | `speed N: unusable - tap_thresh M (the top of the range) still misfires` | At this speed even the least sensitive setting misfires. Skipped. |
 | `speed N: unusable - nothing in ... detected the bed` | At this speed nothing in the range felt the contact. Try a lower `THRESHOLD_START` or a higher speed. |
 | `speed N: unusable - M already misfires and P, the next value tried, misses the bed` | The misfire threshold and the deaf threshold meet with no gap at this speed. Lower `probe_accel` to open one up. |
-| `failed the repeatability run` | The chosen threshold passed the walk but not the longer `SAMPLES` run. Results at that speed are marginal; raise `TRIALS` or `MARGIN`. |
+| `tap_thresh M: ... - dropping the N step margin` | Edge + `MARGIN` missed the bed, so the band is narrower than the margin. The accuracy run repeats at the bare edge. |
+| `failed the accuracy run` | The threshold that passed on the way up failed the longer `SAMPLES` run. Results at that speed are marginal; raise `TRIALS` to confirm the pass, or `MARGIN` to sit further from the misfire edge. |
 
 An aborted run restores the previous `tap_thresh`, lifts back to the height it
 started from, and writes nothing to the config.

@@ -10,9 +10,9 @@
 #                       move only, restored afterwards
 #   rest_time         - settle dwell before arming / after disarming tap
 #                       detection (upstream hardcodes 0.1s each way)
-#   TEST_TAP_TUNE     - sweeps probing speed, searches upwards for the working
-#                       tap_thresh band at each one, scores the pairs by
-#                       probe repeatability, and saves the winner, optionally
+#   TEST_TAP_TUNE     - sweeps probing speed, walks up to the lowest working
+#                       tap_thresh at each one, scores the pairs by probe
+#                       repeatability, and saves the winner, optionally
 #                       scattering the taps over an area so the search does
 #                       not dent one spot of the bed
 #   disable_fans      - works with every fan section type, not only the ones
@@ -50,7 +50,7 @@ TUNE_SPEED_START = 10.
 TUNE_SPEED_END = 30.
 TUNE_SPEED_STEP = 2.
 TUNE_MAX_SPEEDS = 20
-TUNE_TRIALS = 3
+TUNE_TRIALS = 1  # probes per candidate on the way up; 1 stops at the first
 TUNE_SAMPLES = 10
 TUNE_MARGIN = 2  # register steps of headroom probed above the edge
 TUNE_THRESHOLD_STEP = 1  # register steps the walk up to the band takes
@@ -576,19 +576,18 @@ class ADXL345EndstopWrapper:
                 return None, None, below
             below, code = code, min(code + step, hi)
 
-    # The lowest register value that works, and how far above it the margin
-    # was verified. The chip stores the threshold at 612.9 mm/s**2 per step,
-    # so the search runs over register steps - anything finer would re-test
-    # the same register.
+    # The lowest register value that works. The chip stores the threshold at
+    # 612.9 mm/s**2 per step, so the search runs over register steps - anything
+    # finer would re-test the same register.
     #
-    # Everything here works upwards from `lo`, `step` registers at a time:
-    # probe, fail, raise tap_thresh, probe again. That is what keeps the bed
-    # intact. A threshold too low to work misfires before the effector has
-    # descended - one probe, no contact - whereas a threshold too high does
-    # not stop at the bed at all and drives the nozzle down to the descent
-    # floor. Searching from the insensitive end, or hunting for the top of the
-    # band, means paying that price over and over.
-    def _find_band(self, test, lo, hi, step, margin):
+    # The walk goes upwards from `lo`, `step` registers at a time: probe, fail,
+    # raise tap_thresh, probe again, and stop at the first success. That is
+    # what keeps the bed intact. A threshold too low to work misfires before
+    # the effector has descended - one probe, no contact - whereas a threshold
+    # too high does not stop at the bed at all and drives the nozzle down to
+    # the descent floor. Searching from the insensitive end, or probing on past
+    # the first success, means paying that price for nothing.
+    def _find_edge(self, test, lo, hi, step):
         edge, verdict, below = self._walk_up(test, lo, hi, step)
         if edge is None:
             raise self.NoBand(
@@ -611,19 +610,7 @@ class ADXL345EndstopWrapper:
                 "%.0f already misfires and %.0f, the next value tried,"
                 " misses the bed"
                 % (self._code_thresh(below), self._code_thresh(edge)))
-        # Headroom, one register at a time, and no further than the margin
-        # asked for. The top of the band is deliberately left unmeasured:
-        # finding it means probing until the bed is missed, and every value
-        # that misses drives the nozzle into the bed for the whole descent.
-        # `top` is therefore "verified this far up", not "the band ends here".
-        top = edge
-        while top < min(edge + margin, hi):
-            if test(top + 1) != 'pass':
-                break
-            top += 1
-        # Both ends only ever hold a value that has been verified passing, so
-        # a stray result cannot produce a recommendation that was never tested
-        return edge, top
+        return edge
 
     # A print job in progress means the bed is occupied and the toolhead is
     # part way through someone's work. print_stats covers Moonraker-driven
@@ -819,13 +806,13 @@ class ADXL345EndstopWrapper:
 
         gcmd.respond_info(
             "TEST_TAP_TUNE: speeds %s mm/s, tap_thresh %.0f - %.0f mm/s^2"
-            " (reg %d - %d), %d trial(s) per candidate, %d sample(s) per"
+            " (reg %d - %d), %d probe(s) per candidate, %d sample(s) per"
             " speed. Roughly %d-%d probes - this takes a while."
             % (", ".join("%g" % s for s in speeds), self._code_thresh(lo),
                self._code_thresh(hi), lo, hi, trials, samples,
-               len(speeds) * (samples + (1 + margin) * trials),
-               len(speeds) * (samples + (1 + margin) * trials + window)
-               + (hi - lo)))
+               len(speeds) * (samples + trials),
+               len(speeds) * (samples + trials + window * trials)
+               + (hi - lo) * trials))
 
         self.start_probe_session(gcmd)
         self.managed_session = True
@@ -850,22 +837,20 @@ class ADXL345EndstopWrapper:
                     return verdict
 
                 try:
-                    edge, top = self._find_band(test, search_lo, hi,
-                                                thresh_step, margin)
+                    edge = self._find_edge(test, search_lo, hi, thresh_step)
                 except self.NoBand as e:
                     if search_lo == lo:
                         gcmd.respond_info("  speed %5.1f: unusable - %s"
                                           % (speed, e))
                         continue
-                    # The window carried over from the previous speed started
+                    # The floor carried over from the previous speed started
                     # too high. Walk the whole range before giving up on it.
                     gcmd.respond_info(
                         "  speed %5.1f: nothing from the carried-over floor"
                         " up (%s) - starting from the bottom" % (speed, e))
                     search_lo = lo
                     try:
-                        edge, top = self._find_band(test, lo, hi,
-                                                    thresh_step, margin)
+                        edge = self._find_edge(test, lo, hi, thresh_step)
                     except self.NoBand as e2:
                         gcmd.respond_info("  speed %5.1f: unusable - %s"
                                           % (speed, e2))
@@ -875,30 +860,41 @@ class ADXL345EndstopWrapper:
                 # bottom of the range to find it - misfires cost one probe
                 # each and never touch the bed.
                 if edge == search_lo and search_lo > lo:
-                    edge, top = self._find_band(test, lo, hi, thresh_step,
-                                                margin)
-                candidate = top
+                    edge = self._find_edge(test, lo, hi, thresh_step)
+                # The accuracy run is the only thing that taps more than once,
+                # and it runs at the value being recommended, so no separate
+                # verification of the margin is needed.
+                candidate = min(edge + margin, hi)
                 verdict, detail, zs = self._test_tap_code(
                     probe_gcmd, candidate, samples, start_z, lift_speed)
+                if (verdict != 'pass' or len(zs) < 2) and candidate != edge:
+                    # The margin landed past the top of the band. Fall back to
+                    # the edge, which is the value that just passed.
+                    gcmd.respond_info(
+                        "  speed %5.1f  tap_thresh %6.0f: %s - dropping the"
+                        " %d step margin"
+                        % (speed, self._code_thresh(candidate), detail,
+                           margin))
+                    candidate = edge
+                    verdict, detail, zs = self._test_tap_code(
+                        probe_gcmd, candidate, samples, start_z, lift_speed)
                 if verdict != 'pass' or len(zs) < 2:
                     gcmd.respond_info(
                         "  speed %5.1f  tap_thresh %6.0f: failed the"
-                        " repeatability run (%s) - discarded"
+                        " accuracy run (%s) - discarded"
                         % (speed, self._code_thresh(candidate), detail))
                     continue
                 spread = max(zs) - min(zs)
                 mean = sum(zs) / len(zs)
                 sigma = math.sqrt(sum((z - mean) ** 2 for z in zs) / len(zs))
                 scored.append({'speed': speed, 'code': candidate,
-                               'edge': edge, 'headroom': top - edge,
-                               'spread': spread, 'sigma': sigma,
-                               'samples': len(zs)})
+                               'edge': edge, 'spread': spread,
+                               'sigma': sigma, 'samples': len(zs)})
                 gcmd.respond_info(
                     "  speed %5.1f  tap_thresh %6.0f (reg %3d): works from reg"
-                    " %d, +%d of %d headroom, %d samples, range %.4f"
-                    " sigma %.4f"
+                    " %d, %d samples, range %.4f sigma %.4f"
                     % (speed, self._code_thresh(candidate), candidate,
-                       edge, top - edge, margin, len(zs), spread, sigma))
+                       edge, len(zs), spread, sigma))
                 # Start the next speed's walk just below this band instead of
                 # at the bottom of the range. The band moves with speed, but
                 # not usually far, and this is where most of the probes go.
