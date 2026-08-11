@@ -200,7 +200,7 @@ Standard Klipper probe parameters, handled by `probe.ProbeParameterHelper`.
 | Command | Description |
 | ------- | ----------- |
 | `SET_ACCEL_PROBE [TAP_THRESH=<mm/s²>] [TAP_DUR=<s>] [ACCEL=<mm/s²>]` | Adjust tap threshold, tap duration and probing acceleration at runtime and echo the resulting values. Not saved — put the final numbers in the config. |
-| `TEST_TAP_TUNE [X=] [Y=] [Z=] [SPEED_START=] [SPEED_END=] [SPEED_STEP=] [THRESSHOLD_START=] [THRESSHOLD_END=] [TRIALS=] [SAMPLES=] [MARGIN=] [WINDOW=] [SAVE=<0\|1>]` | Home if needed, move to the middle of the bed, and find the best `speed` and `tap_thresh` pair. See [Tuning speed and tap_thresh automatically](#tuning-speed-and-tap_thresh-automatically). |
+| `TEST_TAP_TUNE [X=] [Y=] [Z=] [TEST_TAP_DEVIATION=] [SPEED_START=] [SPEED_END=] [SPEED_STEP=] [THRESSHOLD_START=] [THRESSHOLD_END=] [TRIALS=] [SAMPLES=] [MARGIN=] [WINDOW=] [SAVE=<0\|1>]` | Home if needed, move to the middle of the bed, and find the best `speed` and `tap_thresh` pair. See [Tuning speed and tap_thresh automatically](#tuning-speed-and-tap_thresh-automatically). |
 | `PROBE` | Single probe at the current XY. |
 | `QUERY_PROBE` | Report the current state of the probe pin. Should read `open` with the nozzle in free air. |
 | `PROBE_ACCURACY` | Repeat-probe at the current XY and report the spread. |
@@ -341,6 +341,7 @@ Read this before running it:
 | `X` | middle of the bed | Where to probe. The default is the midpoint of the travel the kinematics report, less `x_offset`. |
 | `Y` | middle of the bed | As `X`, less `y_offset`. |
 | `Z` | `10` | Height each probe starts its descent from. Must clear anything on the bed. |
+| `TEST_TAP_DEVIATION` | `0` | Half-width in mm of the square around `X`/`Y` the taps are scattered over. `0` taps the same spot every time. Anything above `0` picks a random point in `X±dev`, `Y±dev` before every probe, so a few hundred taps do not all land in one place. |
 | `TRAVEL_SPEED` | `50` | mm/s for the move to the probing point. Not the probing speed — that is what the command is measuring. |
 | `SPEED_START` | `2` | First probing speed in mm/s. |
 | `SPEED_END` | `20` | Last probing speed in mm/s. |
@@ -402,6 +403,28 @@ threshold misfires" and sending you off tuning the wrong thing.
 
 Bisection assumes misfiring is monotonic in the threshold, which tap detection
 only roughly is. Confirm the winner with `PROBE_ACCURACY` before trusting it.
+
+### Sparing the bed
+
+A full run is a few hundred nozzle taps, and by default every one of them lands
+on the same square millimetre. On a smooth PEI or a glass bed that eventually
+shows. `TEST_TAP_DEVIATION` spreads them out: with `TEST_TAP_DEVIATION=5` each
+probe first moves to a random point within 5 mm of `X`/`Y` in both axes, at
+`TRAVEL_SPEED`, then descends.
+
+```
+TEST_TAP_TUNE TEST_TAP_DEVIATION=5
+```
+
+The area is clipped to the travel the kinematics report, so a point near an
+edge still works — the square is just cut short, and the run says so.
+
+The cost is that the scoring in step 2 no longer measures one spot. Bed tilt
+and unevenness across the area go straight into the Z spread the speeds are
+ranked by, so the ranking gets noisier as the area grows. Keep the deviation
+small enough that the bed is flat within it — a few millimetres is plenty to
+spread the wear, and 5 mm of a typical bed is flat to well under the spread
+being measured.
 
 ### Running during a print
 

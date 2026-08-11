@@ -12,7 +12,9 @@
 #                       detection (upstream hardcodes 0.1s each way)
 #   TEST_TAP_TUNE     - sweeps probing speed, binary-searches the working
 #                       tap_thresh band at each one, scores the pairs by
-#                       probe repeatability, and saves the winner
+#                       probe repeatability, and saves the winner, optionally
+#                       scattering the taps over an area so the search does
+#                       not dent one spot of the bed
 #   disable_fans      - works with every fan section type, not only the ones
 #                       that happen to expose a fan_speed attribute
 #
@@ -22,6 +24,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
 import math
+import random
 from . import probe, adxl345
 
 REG_THRESH_TAP = 0x1D
@@ -53,6 +56,7 @@ TUNE_MARGIN = 2  # register steps of headroom added to the found edge
 TUNE_Z = 10.  # height the search probes from
 TUNE_TRAVEL_SPEED = 50.  # mm/s for the move to the probing point
 TUNE_WINDOW = 16  # register steps searched around the previous speed's band
+TUNE_DEVIATION = 0.  # mm of X/Y scatter around the probing point, 0 = off
 
 # Probe failures that are a tuning result rather than a fault. Everything
 # else - an SPI readback mismatch, an MCU homing timeout, a shutdown - aborts
@@ -130,6 +134,8 @@ class ADXL345EndstopWrapper:
         self.is_measuring = False
         self.in_session = False
         self.managed_session = False
+        # Probing area TEST_TAP_TUNE works in, set up when it starts
+        self.tune_point = None
         self.printer.register_event_handler('klippy:connect', self._init_adxl)
         self.printer.register_event_handler('gcode:command_error',
                                             self._handle_command_error)
@@ -490,6 +496,18 @@ class ADXL345EndstopWrapper:
         except Exception:
             logging.exception("adxl345_probe: cannot lift to %.3f", start_z)
 
+    # A tuning run taps the bed several hundred times, and every tap is the
+    # nozzle hitting it. TEST_TAP_DEVIATION spreads those taps over a square
+    # of that half-width around the probing point instead of driving them all
+    # into one spot. Returns (None, None) when it is off, so the toolhead is
+    # left where it is and the move is skipped entirely.
+    def _probe_xy(self):
+        point = self.tune_point
+        if point is None or not point['dev']:
+            return None, None
+        return (random.uniform(point['x_lo'], point['x_hi']),
+                random.uniform(point['y_lo'], point['y_hi']))
+
     # A probe attempt at a given THRESH_TAP register value is classified as:
     #   pass      - the probe descended past min_probe_travel and triggered
     #   sensitive - it misfired (tap latched while arming, or triggered on the
@@ -502,7 +520,12 @@ class ADXL345EndstopWrapper:
         self._write_tap_regs()
         zs = []
         for _ in range(trials):
+            # Lift first: the previous probe left the nozzle at the bed, and
+            # traversing from there would drag it across the surface
             toolhead.manual_move([None, None, start_z], lift_speed)
+            x, y = self._probe_xy()
+            if x is not None:
+                toolhead.manual_move([x, y, None], self.tune_point['speed'])
             self.homing_helper.clear_trigger_positions()
             try:
                 self.run_probe(probe_gcmd)
@@ -638,6 +661,8 @@ class ADXL345EndstopWrapper:
                 " Y= explicitly.")
         x = gcmd.get_float('X', center_x)
         y = gcmd.get_float('Y', center_y)
+        dev = gcmd.get_float('TEST_TAP_DEVIATION', TUNE_DEVIATION, minval=0.)
+        self.tune_point = self._scatter_area(gcmd, status, x, y, dev, travel)
         # Lift before traversing: the nozzle may be sitting on the bed, or in
         # a print, from whatever ran before this
         if toolhead.get_position()[2] < z:
@@ -646,7 +671,39 @@ class ADXL345EndstopWrapper:
         toolhead.manual_move([None, None, z], travel)
         gcmd.respond_info("TEST_TAP_TUNE: probing at X%.3f Y%.3f from Z%.3f"
                           % (x, y, z))
+        if dev:
+            area = self.tune_point
+            gcmd.respond_info(
+                "TEST_TAP_TUNE: scattering the taps over X%.3f-%.3f"
+                " Y%.3f-%.3f (TEST_TAP_DEVIATION=%g). Any tilt or unevenness"
+                " across that area lands in the repeatability numbers, so"
+                " keep it small enough that the bed is flat within it."
+                % (area['x_lo'], area['x_hi'], area['y_lo'], area['y_hi'],
+                   dev))
         return z
+
+    # The square of half-width `dev` around (x, y), clipped to the travel the
+    # kinematics report so a scattered tap can never ask for an out-of-range
+    # move. A bed edge clips the square rather than failing the command: the
+    # deviation is there to spread wear, not to define a specific area.
+    def _scatter_area(self, gcmd, status, x, y, dev, travel):
+        x_lo, x_hi = x - dev, x + dev
+        y_lo, y_hi = y - dev, y + dev
+        low, high = status.get('axis_minimum'), status.get('axis_maximum')
+        if dev and low is not None and high is not None:
+            x_lo, x_hi = max(x_lo, low.x), min(x_hi, high.x)
+            y_lo, y_hi = max(y_lo, low.y), min(y_hi, high.y)
+            if x_lo > x_hi or y_lo > y_hi:
+                raise gcmd.error(
+                    "TEST_TAP_TUNE: X%.3f Y%.3f is outside the travel range,"
+                    " so no probing area fits around it" % (x, y))
+            if (x_hi - x_lo < 2 * dev) or (y_hi - y_lo < 2 * dev):
+                gcmd.respond_info(
+                    "TEST_TAP_TUNE: TEST_TAP_DEVIATION=%g runs off the edge"
+                    " of the travel range - the probing area was clipped"
+                    % (dev,))
+        return {'x': x, 'y': y, 'dev': dev, 'speed': travel,
+                'x_lo': x_lo, 'x_hi': x_hi, 'y_lo': y_lo, 'y_hi': y_hi}
 
     def _tune_speeds(self, gcmd):
         start = gcmd.get_float('SPEED_START', TUNE_SPEED_START, above=0.)
@@ -822,6 +879,7 @@ class ADXL345EndstopWrapper:
                        r['spread'], r['sigma'], r['width']))
         finally:
             self.managed_session = False
+            self.tune_point = None
             if not keep:
                 # Best effort: an SPI fault here must not replace the error
                 # that actually stopped the search, nor skip the teardown

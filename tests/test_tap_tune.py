@@ -104,6 +104,7 @@ class DescendHelper:
         speed = float(gcmd.params.get('PROBE_SPEED', 5.))
         sim.tested.append((speed, code))
         th = sim.toolhead
+        sim.probe_points.append((round(th.pos[0], 6), round(th.pos[1], 6)))
         if sim.fault is not None and len(sim.tested) >= sim.fault_after:
             raise CommandError(sim.fault)
         sensitive, deaf = sim.band(speed)
@@ -329,6 +330,8 @@ class Sim:
         self.trigger_z = 0.02
         self.z_min = -2.
         self.tested = []
+        # XY the toolhead was at for every descent
+        self.probe_points = []
         self.fault = None
         self.fault_after = 3
         self.homing_calls = 0
@@ -849,6 +852,80 @@ position_case("nozzle starts on the bed - lifts before traversing", 'xyz',
               {}, (150.0, 110.0), 10.0, 0, start_pos=[5., 5., 0.2])
 position_case("G28 that does not home everything is an error", '', {}, None,
               None, 1, expect_error="G28 did not home", home_result='xy')
+
+
+# --- TEST_TAP_DEVIATION -----------------------------------------------------
+
+def deviation_case(name, params, want_area, expect_error=None,
+                   expect_clip=False):
+    """Every tap must land inside the (clipped) square around the probing
+    point, the taps must actually differ, and the nozzle must be at the start
+    height before any traverse - dragging it across the bed at trigger height
+    would do exactly the damage the deviation exists to avoid."""
+    import random
+    import extras.adxl345_probe as mod
+    random.seed(20250811)
+    sim = Sim(60, 200)
+    wrapper = build(sim, mod)
+    sim.toolhead.moves = []
+    log = []
+    args = dict(SINGLE_SPEED)
+    args['SAVE'] = 0
+    args.update(params)
+    gcmd = GCmd(args, log, quiet=True)
+    print("\n=== deviation: %s ===" % name)
+    try:
+        wrapper.cmd_TEST_TAP_TUNE(gcmd)
+    except CommandError as e:
+        assert expect_error and expect_error in str(e), \
+            "unexpected error: %s" % e
+        print("  ERROR: %s" % e)
+        assert not sim.tested, "%d probes ran anyway" % len(sim.tested)
+        print("  -> expected error, ok")
+        return
+    assert expect_error is None, "expected error %r" % expect_error
+    x_lo, x_hi, y_lo, y_hi = want_area
+    points = sim.probe_points
+    assert points, "no probes ran"
+    for x, y in points:
+        assert x_lo - 1e-9 <= x <= x_hi + 1e-9 \
+            and y_lo - 1e-9 <= y <= y_hi + 1e-9, \
+            "tapped X%.3f Y%.3f, outside %s" % (x, y, (want_area,))
+    distinct = len(set(points))
+    print("  %d taps, %d distinct, X %.3f-%.3f Y %.3f-%.3f"
+          % (len(points), distinct, min(p[0] for p in points),
+             max(p[0] for p in points), min(p[1] for p in points),
+             max(p[1] for p in points)))
+    if x_hi > x_lo:
+        assert distinct > len(points) // 2, \
+            "%d taps but only %d distinct points" % (len(points), distinct)
+    else:
+        assert distinct == 1, "%d distinct points, expected one spot" \
+            % (distinct,)
+    # Descents are not commanded moves, so every recorded move is a lift or a
+    # traverse: none of them may happen below the start height
+    start_z = float(params.get('Z', 10))
+    for pos, _speed in sim.toolhead.moves:
+        assert pos[2] >= start_z - 1e-9, \
+            "moved to X%.3f Y%.3f at z %.3f, below the start height" \
+            % (pos[0], pos[1], pos[2])
+    clipped = [ln for ln in log if 'was clipped' in ln]
+    assert bool(clipped) == expect_clip, \
+        "clip warning %s" % ("missing" if expect_clip else "unexpected")
+    if expect_clip:
+        print("  %s" % clipped[0].strip())
+    print("  -> ok")
+
+
+deviation_case("default taps one spot", {}, (150., 150., 110., 110.))
+deviation_case("DEVIATION=5 scatters around the centre",
+               {'TEST_TAP_DEVIATION': 5}, (145., 155., 105., 115.))
+deviation_case("area is clipped to the travel range",
+               {'X': 2, 'Y': 3, 'TEST_TAP_DEVIATION': 5},
+               (0., 7., 0., 8.), expect_clip=True)
+deviation_case("point outside the travel range is an error",
+               {'X': 400, 'Y': 110, 'TEST_TAP_DEVIATION': 5}, None,
+               expect_error="outside the travel range")
 
 
 # --- active print guard -----------------------------------------------------
