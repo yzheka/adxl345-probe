@@ -407,7 +407,7 @@ SINGLE_SPEED = {'SPEED_START': 5, 'SPEED_END': 5, 'SPEED_STEP': 1,
                 'SAMPLES': 4, 'DEVIATION': 0}
 
 
-def walk_lands_on(wrapper, sensitive, deaf, lo=10000., hi=100000., step=1000.):
+def walk_lands_on(wrapper, sensitive, deaf, lo=10420., hi=100000., step=613.):
     """The threshold the walk has to stop at: the first rung it actually probes
     whose register is at or above the misfire edge. None if that one already
     misses the bed, which is the whole band gone. Rungs at or below 1g are
@@ -454,9 +454,9 @@ def run(name, sensitive_edge, deaf_edge, params, expect_error=None):
     assert expect_error is None, "expected error %r, got success" % expect_error
     want = walk_lands_on(
         wrapper, sensitive_edge, deaf_edge,
-        float(args.get('THRESHOLD_START', 10000.)),
+        float(args.get('THRESHOLD_START', 10420.)),
         float(args.get('THRESHOLD_END', 100000.)),
-        float(args.get('THRESHOLD_STEP', 1000.)))
+        float(args.get('THRESHOLD_STEP', 613.)))
     assert want is not None, "the case itself expects no usable threshold"
     staged = sim.configfile.saved.get(('adxl345_probe', 'tap_thresh'))
     print("  taps: %d, thresholds tried: %d"
@@ -487,12 +487,13 @@ run("first threshold already taps", 1, 200, {})
 run("misfire edge just above the floor", 18, 200, {})
 run("misfire edge mid range", 90, 200, {})
 run("misfire edge near the end", 160, 200, {})
-# A one-register band is only found if the ladder happens to land on it: a
-# 1000 mm/s^2 step advances the register by one or two, so it can step over one
-run("narrow band the ladder lands on", 61, 61, {})
-run("narrow band the ladder steps over", 62, 62, {},
+# The default step is one register, so even a one-register band is found
+run("narrow band, one register wide", 62, 62, {})
+# A coarser step advances one or two registers at a time and can step clean
+# over such a band - 1000 mm/s^2 misses register 19, among 56 others
+run("a coarse step steps over it", 19, 19, {'THRESHOLD_STEP': 1000},
     expect_error="no speed produced a usable tap_thresh")
-run("...and a 613 step finds it", 62, 62, {'THRESHOLD_STEP': 613})
+run("...and the default step finds it", 19, 19, {})
 # Below 1g the chip can never latch a tap, so the walk starts above it however
 # low it is asked to start
 run("a start below 1g is raised to the floor", 90, 200,
@@ -523,9 +524,14 @@ def defaults_case():
              len(thresholds)))
     assert (speeds[0], speeds[-1], len(speeds)) == (10., 30., 11), \
         "speeds %s" % (speeds,)
-    assert thresholds[0] == 10000., "starts at %g" % thresholds[0]
+    assert wrapper._tap_code(thresholds[0]) == mod.TAP_FLOOR_CODE, \
+        "starts at %g, register %d" \
+        % (thresholds[0], wrapper._tap_code(thresholds[0]))
     assert thresholds[-1] <= 100000., "ends at %g" % thresholds[-1]
-    assert thresholds[1] - thresholds[0] == 1000., "step is not 1000"
+    # one register per rung, so every register in the range is tried
+    codes = [wrapper._tap_code(t) for t in thresholds]
+    assert codes == list(range(codes[0], codes[-1] + 1)), \
+        "the default step skips registers"
     assert mod.TAP_GRAVITY_CODE == 16, \
         "1g is register %d, expected 16" % mod.TAP_GRAVITY_CODE
     print("  -> ok")
@@ -537,7 +543,9 @@ def floor_case():
     to the descent floor to demonstrate what the register value already
     proves."""
     import extras.adxl345_probe as mod
-    for start, want_dead in ((None, 1), (1000, 10)):
+    # The default starts on the first usable register, so nothing is dead
+    # there; a low start walks through the whole dead zone
+    for start, want_dead in ((None, 0), (1000, 16)):
         sim = Sim(30, 200)
         wrapper = build(sim, mod)
         log = []
@@ -554,9 +562,13 @@ def floor_case():
         print("  first probed reg %d, %d dead rungs announced up front"
               % (sim.tested[0][1], want_dead))
         assert not dead, "probed registers %s, at or below 1g" % (dead,)
-        assert announced, "the dead rungs were not announced"
-        assert "the first %d are" % want_dead in announced[0], \
-            "announced %r, expected %d dead rungs" % (announced[0], want_dead)
+        if want_dead:
+            assert announced, "the dead rungs were not announced"
+            assert "the first %d are" % want_dead in announced[0], \
+                "announced %r, expected %d dead rungs" \
+                % (announced[0], want_dead)
+        else:
+            assert not announced, "announced dead rungs it does not have"
         assert sim.tested[0][1] == mod.TAP_FLOOR_CODE, \
             "first probe was reg %d" % sim.tested[0][1]
     print("  -> ok")
@@ -1024,9 +1036,9 @@ def intermittent_case():
     not good enough: the walk carries on up instead of failing the speed."""
     import extras.adxl345_probe as mod
     sim = Sim(28, 200)
-    # The first rung of the ladder at or above the misfire edge is 18000
-    # mm/s^2, register 29. Make that one work once and then misfire.
-    sim.flaky_code = 29
+    # The ladder tries every register, so the first one at or above the
+    # misfire edge is 28 itself. Make it work once and then misfire.
+    sim.flaky_code = 28
     wrapper = build(sim, mod)
     log = []
     gcmd = GCmd({'SPEED_START': 5, 'SPEED_END': 5, 'SPEED_STEP': 1,

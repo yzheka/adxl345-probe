@@ -182,16 +182,12 @@ fall-back never happens, and no tap is ever registered:
 the module's own `tap_thresh` default of `5000` is inside the dead zone — it is
 inherited from upstream and has to be raised.
 
-`ADXL_PROBE_CALIBRATE` starts its walk wherever `THRESHOLD_START` says, dead
-zone included, but it does not *probe* the dead rungs. Whether a register can
-latch is arithmetic, and a probe that cannot latch runs its move to the descent
-floor with the nozzle loaded against the bed for the whole of it. So those rungs
-are reported and stepped over:
-
-```
-  speed  10.0  tap_thresh  10000 (reg  16): skipped   at or below 1g, no tap can latch there - not probed
-  speed  10.0  tap_thresh  11000 (reg  17): sensitive Probe triggered prior to movement
-```
+`ADXL_PROBE_CALIBRATE` defaults its `THRESHOLD_START` to 10420 — register 17 —
+so a bare run never goes near the dead zone. If you point it lower, it starts
+where you say but does not *probe* the dead rungs: whether a register can latch
+is arithmetic, and a probe that cannot latch runs its move to the descent floor
+with the nozzle loaded against the bed for the whole of it. Those rungs are
+counted in the opening summary and stepped over.
 
 The symptom is the giveaway: a threshold that is too *low* reads as
 `triggered after only 0.000mm of travel` (a misfire) only while it is above the
@@ -412,9 +408,9 @@ and stages nothing.
 
 | Parameter | Default | Description |
 | --------- | ------- | ----------- |
-| `THRESHOLD_START` | `10000` | First `tap_thresh` tried at every speed, in mm/s². The walk starts exactly here, wherever you put it. Rungs at or below 1 g are listed in the log and stepped over without being probed, since nothing can latch there and a probe would only drive the nozzle into the bed to prove it — see [The 1 g floor](#the-1-g-floor). |
+| `THRESHOLD_START` | `10420` | First `tap_thresh` tried at every speed, in mm/s². The default is register 17, the lowest that can latch a tap at all — see [The 1 g floor](#the-1-g-floor). The walk starts exactly where you put it, but rungs at or below 1 g are stepped over without being probed: nothing can latch there, and a probe would only drive the nozzle into the bed to prove it. |
 | `THRESHOLD_END` | `100000` | Highest `tap_thresh` the walk will reach before giving up on a speed. |
-| `THRESHOLD_STEP` | `1000` | How much `tap_thresh` rises after a misfire, in mm/s². The chip stores the threshold at **612.9 mm/s² per register step**, so values that land on a register already tried are skipped rather than re-probed. |
+| `THRESHOLD_STEP` | `613` | How much `tap_thresh` rises after a misfire, in mm/s². The chip stores the threshold at **612.9 mm/s² per register step**, and the default of 613 is exactly one of them: every register in the range gets tried, so a narrow band cannot be stepped over and the walk stops on the lowest threshold that works. Nothing finer is worth asking for — values landing on a register already tried are dropped, so a smaller step probes the same settings. A larger one trades resolution for time; see [Choosing the range](#choosing-the-range). |
 | `SPEED_START` | `10` | First probing speed in mm/s. |
 | `SPEED_END` | `30` | Last probing speed in mm/s. |
 | `SPEED_STEP` | `2` | Increment. The defaults measure 10, 12, 14, … 30 mm/s — eleven speeds. Capped at 20 per run. |
@@ -427,13 +423,83 @@ and stages nothing.
 | `TRAVEL_SPEED` | `50` | mm/s for the moves to the probing point. Not the probing speed — that is what the command is measuring. |
 | `CHIP` | — | Accelerometer name, matching `chip:`. Optional; only useful if you have named your `[adxl345]` section. |
 
+### Choosing the range
+
+The defaults are chosen to be safe and exact rather than fast. Both threshold
+values sit on the chip's register grid instead of round decimals, because that
+grid is what the hardware actually has.
+
+**`THRESHOLD_START=10420`** is register 17, the first that can latch a tap.
+Nothing below it can work, so a lower start only adds rungs that get stepped
+over. If you already know a `tap_thresh` that homes reliably, start ~2000 below
+*that* instead — the band cannot be under it, and everything lower is wasted
+climbing.
+
+**`THRESHOLD_STEP=613`** is one register. That matters twice: a coarser step can
+step clean over a narrow band, and because the walk stops at the *first*
+threshold that works, landing two or three registers above the true bottom edge
+means a harder tap than the machine needs — which shows up directly as a worse
+average trigger height.
+
+| Step | Probes to walk the full range | Registers skipped |
+| --- | --- | --- |
+| 100 | 147 | 0 |
+| **613** | **147** | **0** |
+| 1000 | 90 | 57 of 147 |
+| 2000 | 45 | 89 |
+| 5000 | 18 | 129 |
+
+The first two rows are the same because rungs landing on an already-tried
+register are dropped before probing: any step at or below 613 probes exactly one
+setting per register. So 613 is the finest step worth asking for, and a larger
+one is purely a time trade.
+
+What full resolution costs, in extra misfires per speed — each a couple of
+seconds, none of them touching the bed:
+
+| Band starts at | step 613 | step 1000 |
+| --- | --- | --- |
+| reg 19 (11645 mm/s²) | 2 | 2 |
+| reg 25 (15323 mm/s²) | 8 | 5 |
+| reg 40 (24517 mm/s²) | 23 | 15 |
+| reg 60 (36775 mm/s²) | 43 | 27 |
+
+**Speeds.** Each one costs its climb plus `SAMPLES` measuring taps, so a minute
+or two. For a first run, widen the step rather than narrowing the span — five
+speeds show the trend as well as eleven:
+
+```
+ADXL_PROBE_CALIBRATE SPEED_STEP=5
+```
+
+Then re-run with `SPEED_STEP=2` over whichever part of the range looked useful.
+
+Two things to check before sweeping to 30 mm/s. `[printer] max_z_velocity`
+clamps every Z move, and a probing move is a Z move — if yours is below
+`SPEED_END`, the top of the sweep is silently clamped and you will measure the
+same actual velocity several times over, with a different `tap_thresh` found for
+each. And impact force scales with speed: the top of the sweep is where the bed
+takes the most punishment, which is the cost of finding out how fast you can
+probe.
+
+**Read the table, not just the winner.** The ranking picks the lowest average
+trigger height, and two speed-dependent effects push that figure *down* as speed
+rises: a faster probe needs a higher `tap_thresh`, which needs more force and so
+more deflection before latching, and homing latency across a CAN toolhead puts
+the reported trigger deeper in proportion to speed. If the averages in the
+results table march monotonically with speed, the "winner" is just whichever end
+of the range you swept to and it is not telling you much — pick on `range`
+instead: the fastest speed whose range is still comfortably under 0.01 mm. If the
+averages turn over somewhere in the middle, that is a real optimum and the pick
+is worth taking.
+
 ### Read this before running it
 
 - **This takes a while.** The defaults are eleven speeds, each walking up from
-  the 1 g floor, so roughly 450 probes for a machine whose threshold lands near
-  34000 — about 20 minutes. Only about a tenth of them touch the bed. Raise
-  `THRESHOLD_START` to skip the part of the climb you already know misfires,
-  which is the biggest saving available.
+  the 1 g floor one register at a time, so roughly 540 probes for a machine
+  whose threshold lands near 34000 — about 25 minutes. Only 121 of them touch
+  the bed. See [Choosing the range](#choosing-the-range) for the two
+  settings that cut it down.
 - **Stand over the machine for the first run.** A probe at a threshold that is
   too high does not stop at the bed; the nozzle drives down to `position_min` /
   `minimum_z_position`. Walking up from the sensitive end means the run should
@@ -445,10 +511,9 @@ and stages nothing.
   `G28` itself fails, the command cannot get started. Raise the threshold by
   hand first with `SET_ACCEL_PROBE TAP_THRESH=...`, or home once with a Z
   endstop, then run this.
-- `DEVIATION` trades bed wear against measurement quality: the accuracy figure
-  it produces includes however much the bed rises and falls across that square.
-  20 mm is a reasonable default on a flat bed; drop it if your bed is not flat
-  over that distance, and use `DEVIATION=0` for the truest single-point number.
+- `DEVIATION` spreads the climb's taps over an area so they do not all land in
+  one place. It does not affect the measurement, which always happens on a
+  single spot.
 - If `[adxl345_probe]` lives in an included file, `SAVE_CONFIG` will refuse to
   write it (Klipper cannot edit includes). Copy the two printed lines in by hand
   in that case.

@@ -56,12 +56,17 @@ TAP_GRAVITY_CODE = int(adxl345.FREEFALL_ACCEL / TAP_SCALE)
 TAP_FLOOR_CODE = TAP_GRAVITY_CODE + 1
 
 # ADXL_PROBE_CALIBRATE defaults
-# 10000 truncates to register 16, which is exactly 1g and therefore still deaf,
-# so the walk actually starts one register up (see TAP_FLOOR_CODE). Kept as the
-# round number because that is what it means to ask for: "start at the bottom".
-CAL_THRESHOLD_START = 10000.
+# Both of these are the register grid rather than round decimals: 10420 mm/s**2
+# is register 17, the lowest that can latch a tap at all, and a step of 613
+# advances exactly one register. A round 1000 would advance one or two
+# registers unevenly, skipping 57 of the 147 in the range - enough to step over
+# a narrow band, and enough to land above the bottom of a wide one, which is a
+# harder tap than the machine needs. Nothing finer than 613 is worth asking
+# for: values landing on a register already tried are dropped, so a smaller
+# step probes exactly the same settings.
+CAL_THRESHOLD_START = math.ceil(TAP_FLOOR_CODE * TAP_SCALE)
 CAL_THRESHOLD_END = 100000.
-CAL_THRESHOLD_STEP = 1000.  # mm/s**2 added after a misfire
+CAL_THRESHOLD_STEP = math.ceil(TAP_SCALE)  # one register per rung
 CAL_SPEED_START = 10.
 CAL_SPEED_END = 30.
 CAL_SPEED_STEP = 2.
