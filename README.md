@@ -369,9 +369,18 @@ before the effector has descended, so the climb costs one contactless probe per
 step. A `deaf` result ends the speed — nothing higher can be more sensitive.
 
 **2. Measure the accuracy.** The first threshold that taps is the one used.
-`SAMPLES` taps run at it, lifting `LIFT` mm between them rather than returning
-to `Z`, and the Z spread they produce is the accuracy for that pair — the same
-measurement `PROBE_ACCURACY` reports.
+`SAMPLES` taps run at it, **on the spot the successful tap landed on**, lifting
+`LIFT` mm between them rather than returning to `Z`. Nothing moves in XY during
+the measurement — the point is to measure the probe, and moving between taps
+would fold the shape of the bed into the result.
+
+The **average trigger height** of those taps is the accuracy for that pair. It
+is how far past the surface the effector carried before the chip saw the
+contact, so a lower average is a probe that felt the bed sooner. The spread and
+sigma are reported alongside it.
+
+The tap that found the threshold is not counted: it descended from `Z` rather
+than from `LIFT`, so it is not the same measurement.
 
 If the accuracy run breaks down part way, that threshold only works
 intermittently: the walk carries on upward instead of giving up on the speed.
@@ -380,9 +389,9 @@ intermittently: the walk carries on upward instead of giving up on the speed.
 `THRESHOLD_START`, so a band that moves — in either direction — is always
 found.
 
-The pairs are then ranked by spread, ties broken by the lower sigma. The winner
-is applied immediately and staged for `SAVE_CONFIG`, which the command does
-**not** run for you:
+The pairs are then ranked by average trigger height, lowest first, ties broken
+by the smaller spread. The winner is applied immediately and staged for
+`SAVE_CONFIG`, which the command does **not** run for you:
 
 ```
 ADXL_PROBE_CALIBRATE: best accuracy was 0.0062 mm at speed 14 with tap_thresh 34000.
@@ -411,7 +420,7 @@ and stages nothing.
 | `SPEED_STEP` | `2` | Increment. The defaults measure 10, 12, 14, … 30 mm/s — eleven speeds. Capped at 20 per run. |
 | `X` | middle of the bed | Centre of the probing area. The default is the midpoint of the travel the kinematics report, less `x_offset`. |
 | `Y` | middle of the bed | As `X`, less `y_offset`. |
-| `DEVIATION` | `20` | Half-width in mm of the square around `X`/`Y` that taps are scattered over. Every tap picks a fresh random point in `X±dev`, `Y±dev`, so a run does not dent one spot. `0` taps the same place every time. |
+| `DEVIATION` | `20` | Half-width in mm of the square around `X`/`Y` that the **walk's** taps are scattered over, so the climb does not dent one spot. Each tap of the walk picks a fresh random point in `X±dev`, `Y±dev`. The accuracy measurement never moves, whatever this is set to. `0` puts everything on the same spot. |
 | `SAMPLES` | `10` | Taps per accuracy measurement. This is the number the ranking is built on — don't set it below about 5. |
 | `LIFT` | `1.0` | How far the nozzle rises between those taps, in mm. Must be above `min_probe_travel`, or every tap would trigger inside it and be read as a misfire; the command refuses to start otherwise. |
 | `Z` | `10` | Height the first tap at each threshold descends from. Must clear anything on the bed. The move to the probing point also happens at this height — on a delta the reachable radius near the top of the travel is nil, so traversing at the height `G28` finishes at is out of range. |
@@ -457,14 +466,15 @@ eleven-speed run whose band drifts with speed:
 | | Total probes | Misfires (no contact) | Taps | Drove into the bed |
 | --- | --- | --- | --- | --- |
 | Bisecting down from `THRESHOLD_END` | 385 | 26 | 341 | 18 |
-| `ADXL_PROBE_CALIBRATE` | 712 | 602 | **110** | **0** |
+| `ADXL_PROBE_CALIBRATE` | 613 | 492 | **121** | **0** |
 
-Ten bed contacts per speed — one to find the threshold, nine more to measure it
+Eleven bed contacts per speed — one to find the threshold and ten to measure it
 — however far the walk had to climb.
 
-**The spot.** Those contacts still land in the same place unless you spread
-them, which is what `DEVIATION` does. It defaults to 20 mm, so a bare
-`ADXL_PROBE_CALIBRATE` already scatters; `DEVIATION=0` turns it off.
+**The spot.** The walk's contacts are spread out by `DEVIATION`, which defaults
+to 20 mm, so the climb does not land in one place. The ten measuring taps do all
+land together, because that is the only way the average means anything: the
+accuracy measurement never moves, whatever `DEVIATION` is set to.
 
 The area is clipped to the travel the kinematics report, so a point near an edge
 still works — the square is just cut short, and the run says so. On a delta,
@@ -476,27 +486,35 @@ kept inside the circle.
 ```
 ADXL_PROBE_CALIBRATE: probing at X0.000 Y0.000 from Z10.000
 ADXL_PROBE_CALIBRATE: scattering the taps over X-20.000-20.000 Y-20.000-20.000 (DEVIATION=20). ...
-  speed  10.0  tap_thresh   1000 (reg   1): sensitive Probe triggered prior to movement
-  speed  10.0  tap_thresh   2000 (reg   3): sensitive Probe triggered prior to movement
+  speed  10.0  tap_thresh  10000 (reg  16): skipped   at or below 1g, no tap can latch there - not probed
+  speed  10.0  tap_thresh  11000 (reg  17): sensitive Probe triggered prior to movement
+  speed  10.0  tap_thresh  12000 (reg  19): sensitive Probe triggered prior to movement
   ... one line per step up ...
   speed  10.0  tap_thresh  33000 (reg  53): sensitive Probe triggered prior to movement
   speed  10.0  tap_thresh  34000 (reg  55): pass      triggered at z 0.0193
-  speed  10.0  tap_thresh  34000: 10 taps, range 0.0080 sigma 0.0028
-  speed  12.0  tap_thresh   1000 (reg   1): sensitive Probe triggered prior to movement
+  speed  10.0  tap_thresh  34000: 10 taps at one spot, average z 0.0180 (range 0.0031 sigma 0.0011)
+  speed  12.0  tap_thresh  10000 (reg  16): skipped   at or below 1g, no tap can latch there - not probed
   ...
 ADXL_PROBE_CALIBRATE: results, best first
-  1. speed  10.0  tap_thresh  34000  range 0.0080  sigma 0.0028  (10 taps)
-  2. speed  12.0  tap_thresh  37000  range 0.0104  sigma 0.0037  (10 taps)
+  1. speed  10.0  tap_thresh  34000  average z 0.0180  range 0.0031  sigma 0.0011  (10 taps)
+  2. speed  12.0  tap_thresh  37000  average z 0.0224  range 0.0044  sigma 0.0016  (10 taps)
 ```
 
 The `sensitive` lines are the climb — each one is a probe that misfired without
-touching the bed. The single `pass` is where the walk stops, and the line after
-it is the accuracy measurement at that threshold. `range` is what the speeds are
-ranked by; `sigma` breaks ties.
+touching the bed. The single `pass` is where the walk stops. The line after it is
+the accuracy measurement: ten taps on that one spot, at that one threshold and
+speed.
 
-A range that grows steadily with speed is the normal picture. A speed reported
-as `unusable` is not a fault: it means no threshold in the range worked there,
-the run says so and carries on.
+`average z` is what the speeds are ranked by — how far past the surface the
+effector carried before the chip saw the contact — and the smaller `range`
+breaks ties. `range` and `sigma` are reported for information: a range much
+larger than the differences between speeds means the ranking is not telling you
+much, and `probe_accel` is the first thing to look at.
+
+An average that grows steadily with speed is the normal picture: a faster probe
+hits harder and needs a higher threshold, and a higher threshold lets the nozzle
+travel further before latching. A speed reported as `unusable` is not a fault:
+it means no threshold in the range worked there, the run says so and carries on.
 
 ### Failure messages
 

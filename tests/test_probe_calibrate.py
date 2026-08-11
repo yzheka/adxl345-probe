@@ -120,7 +120,7 @@ class DescendHelper:
         if code > deaf:
             th.pos[2] = sim.z_min
             raise CommandError("No trigger on probe after full movement")
-        th.pos[2] = sim.trigger_z + sim.jitter(speed)
+        th.pos[2] = sim.trigger(speed) + sim.jitter(speed)
         self.results.append(list(th.pos))
 
 
@@ -334,6 +334,8 @@ class Sim:
         self.noise = noise or {}
         self.noise_step = 0
         self.trigger_z = 0.02
+        # speed -> trigger height, for measuring the average the ranking uses
+        self.trigger_heights = {}
         self.z_min = -2.
         # Cartesian travel by default. A delta reports the square that bounds
         # its round bed, symmetric about the origin.
@@ -367,6 +369,11 @@ class Sim:
 
     def band(self, speed):
         return self.bands.get(speed, (self.sensitive_edge, self.deaf_edge))
+
+    def trigger(self, speed):
+        """Height the tap latches at. A harder-hitting probe carries further
+        past the surface before the chip sees it, so this moves with speed."""
+        return self.trigger_heights.get(speed, self.trigger_z)
 
     def jitter(self, speed):
         noise = self.noise.get(speed, 0.)
@@ -825,11 +832,12 @@ classification_case("genuine misfire", "ADXL345 probe triggered after only"
 # --- multi-speed measurement ------------------------------------------------
 
 def speed_case(name, bands, noise, want_speed, params=None,
-               expect_error=None):
+               expect_error=None, triggers=None):
     """Drive the full speed sweep against a printer whose working band and
-    trigger repeatability both move with probing speed."""
+    trigger height both move with probing speed."""
     import extras.adxl345_probe as mod
     sim = Sim(60, 200, bands=bands, noise=noise)
+    sim.trigger_heights = triggers or {}
     wrapper = build(sim, mod)
     log = []
     args = {'SPEED_START': 2, 'SPEED_END': 8, 'SPEED_STEP': 2,
@@ -847,7 +855,7 @@ def speed_case(name, bands, noise, want_speed, params=None,
         return
     assert expect_error is None, "expected error %r" % expect_error
     for line in log:
-        if line.startswith("  1.") or 'best accuracy' in line:
+        if line.startswith("  1.") or 'lowest average' in line:
             print("  %s" % line.strip().split("\n")[0])
     got_speed = float(sim.configfile.saved[('adxl345_probe', 'speed')])
     got_reg = sim.chip.regs[0x1D]
@@ -867,27 +875,28 @@ def speed_case(name, bands, noise, want_speed, params=None,
 
 
 # The band drifts upward with speed - a faster tap hits harder, so it takes a
-# higher threshold to stop misfiring. 4 mm/s is the most repeatable. The
-# register kept for each speed is the first rung of the ladder at or above its
-# misfire edge, which the case derives rather than hard-coding.
+# higher threshold to stop misfiring. The register kept for each speed is the
+# first rung of the ladder at or above its misfire edge, which the case derives
+# rather than hard-coding.
 DRIFT = {2.0: (20, 40), 4.0: (26, 50), 6.0: (34, 62), 8.0: (44, 78)}
-speed_case("accuracy picks the winner", DRIFT,
-           {2.0: 0.020, 4.0: 0.004, 6.0: 0.012, 8.0: 0.030}, 4.0)
 
-# Two speeds tie on spread - both scatter over 0.010. The lower sigma breaks
-# it: 6 mm/s clusters around the middle, 4 mm/s sits at the two extremes. Both
-# offset cycles are 4 long and SAMPLES is 4, so every measurement sees one
-# whole cycle whatever the phase.
-speed_case("sigma breaks a tie on spread", DRIFT,
-           {2.0: 0.020,
-            4.0: (-0.005, 0.005, -0.005, 0.005),
-            6.0: (-0.005, 0.0, 0.005, 0.0),
-            8.0: 0.030}, 6.0)
+# 4 mm/s latches closest to the surface, so it wins on average trigger height
+speed_case("the lowest average trigger height wins", DRIFT, {}, 4.0,
+           triggers={2.0: 0.030, 4.0: 0.012, 6.0: 0.020, 8.0: 0.040})
+
+# Two speeds tie on the average - both latch at 0.020 - so the spread decides.
+# The offset cycles are 4 long and SAMPLES is 4, so every measurement sees one
+# whole cycle whatever the phase, and both average exactly 0.020.
+speed_case("the spread breaks a tie on the average", DRIFT,
+           {4.0: (-0.005, 0.005, -0.005, 0.005),
+            6.0: (-0.001, 0.001, -0.001, 0.001)}, 6.0,
+           triggers={2.0: 0.030, 4.0: 0.020, 6.0: 0.020, 8.0: 0.040})
 
 # One speed has no usable threshold at all - it is skipped, not fatal
 speed_case("a speed with no usable threshold is skipped",
            {2.0: (20, 40), 4.0: (60, 55), 6.0: (34, 62), 8.0: (44, 78)},
-           {2.0: 0.030, 4.0: 0.001, 6.0: 0.008, 8.0: 0.020}, 6.0)
+           {}, 6.0,
+           triggers={2.0: 0.030, 4.0: 0.005, 6.0: 0.012, 8.0: 0.040})
 
 # No speed works at all
 speed_case("no speed works",
@@ -895,6 +904,34 @@ speed_case("no speed works",
             8.0: (200, 100)}, {}, None,
            expect_error="no speed produced a usable tap_thresh")
 
+
+def accuracy_spot_case():
+    """The accuracy taps all land on the same spot even with DEVIATION set:
+    moving between them would fold the shape of the bed into the average."""
+    import random
+    import extras.adxl345_probe as mod
+    random.seed(20250811)
+    sim = Sim(22, 200)
+    wrapper = build(sim, mod)
+    log = []
+    gcmd = GCmd({'SPEED_START': 5, 'SPEED_END': 5, 'SPEED_STEP': 1,
+                 'SAMPLES': 6, 'DEVIATION': 20}, log, quiet=True)
+    print("\n=== accuracy run: one spot, DEVIATION=20 ===")
+    wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
+    points = sim.probe_points
+    walk, measured = points[:-6], points[-6:]
+    print("  %d walk taps at %d distinct points, %d accuracy taps at %d"
+          % (len(walk), len(set(walk)), len(measured), len(set(measured))))
+    assert len(set(measured)) == 1, \
+        "the accuracy run moved: %s" % (set(measured),)
+    assert len(set(walk)) > 1, "the walk did not scatter: %s" % (set(walk),)
+    # and it measured where the walk's successful tap landed
+    assert measured[0] == walk[-1], \
+        "measured at %s, tapped at %s" % (measured[0], walk[-1])
+    print("  -> ok")
+
+
+accuracy_spot_case()
 
 def restart_case():
     """Every speed starts the walk over at THRESHOLD_START, so a band that

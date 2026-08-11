@@ -531,19 +531,21 @@ class ADXL345EndstopWrapper:
         # the point that was asked for rather than one that cannot be reached.
         return point['x'], point['y']
 
-    # One tap, from `from_z`, at a random point if DEVIATION is set. Classified
-    # as:
+    # One tap, from `from_z`. `scatter` picks a fresh random point within
+    # DEVIATION first; without it the tap lands wherever the last one did,
+    # which is what an accuracy measurement needs - moving between taps would
+    # fold the shape of the bed into the numbers. Classified as:
     #   pass      - descended past min_probe_travel and triggered
     #   sensitive - misfired (tap latched while arming, or triggered on the
     #               start-of-move acceleration): tap_thresh is too low
     #   deaf      - the move ran to its end without triggering: too high
     # Returns (verdict, detail, trigger z or None).
-    def _tap(self, probe_gcmd, from_z, lift_speed, safe_z):
+    def _tap(self, probe_gcmd, from_z, lift_speed, safe_z, scatter=True):
         toolhead = self.printer.lookup_object('toolhead')
         # Lift before traversing: the last tap left the nozzle on the bed, and
         # moving in XY from there would drag it across the surface
         toolhead.manual_move([None, None, from_z], lift_speed)
-        x, y = self._probe_xy()
+        x, y = self._probe_xy() if scatter else (None, None)
         if x is not None:
             toolhead.manual_move([x, y, None], self.cal_point['speed'])
         self.homing_helper.clear_trigger_positions()
@@ -660,16 +662,20 @@ class ADXL345EndstopWrapper:
                     "tap_thresh %.0f already misses the bed" % (thresh,))
             if verdict == 'sensitive':
                 continue
-            # It tapped. Measure the accuracy of that pair, lifting `lift` mm
-            # between taps rather than returning to the start height.
-            zs = [] if z is None else [z]
+            # It tapped. Measure that pair here, on this spot, `samples` times,
+            # lifting `lift` mm between taps rather than returning to the start
+            # height. No scatter: the point is to measure the probe, and moving
+            # between taps would measure the bed as well. The tap that found
+            # the threshold is not counted - it descended from the start height
+            # rather than from `lift`, so it is not the same measurement.
+            zs = []
             from_z = (z if z is not None
                       else self.printer.lookup_object(
                           'toolhead').get_position()[2]) + lift
             failed = None
-            for _ in range(samples - len(zs)):
+            for _ in range(samples):
                 verdict, detail, z = self._tap(probe_gcmd, from_z, lift_speed,
-                                               start_z)
+                                               start_z, scatter=False)
                 if verdict != 'pass':
                     failed = (verdict, detail)
                     break
@@ -677,16 +683,17 @@ class ADXL345EndstopWrapper:
                     zs.append(z)
                     from_z = z + lift
             if failed is None and len(zs) >= 2:
-                spread = max(zs) - min(zs)
                 mean = sum(zs) / len(zs)
+                spread = max(zs) - min(zs)
                 sigma = math.sqrt(sum((v - mean) ** 2 for v in zs)
                                   / len(zs))
                 gcmd.respond_info(
-                    "  speed %5.1f  tap_thresh %6.0f: %d taps, range %.4f"
-                    " sigma %.4f" % (speed, thresh, len(zs), spread, sigma))
+                    "  speed %5.1f  tap_thresh %6.0f: %d taps at one spot,"
+                    " average z %.4f (range %.4f sigma %.4f)"
+                    % (speed, thresh, len(zs), mean, spread, sigma))
                 self._lift_to(start_z, lift_speed)
-                return {'speed': speed, 'thresh': thresh, 'spread': spread,
-                        'sigma': sigma, 'samples': len(zs)}
+                return {'speed': speed, 'thresh': thresh, 'mean': mean,
+                        'spread': spread, 'sigma': sigma, 'samples': len(zs)}
             # The accuracy run broke down, so this threshold only works
             # intermittently. Carry on up.
             self._lift_to(start_z, lift_speed)
@@ -775,9 +782,9 @@ class ADXL345EndstopWrapper:
                     " tap_thresh. Lower probe_accel, check the wiring with"
                     " QUERY_PROBE, and confirm the probe triggers when you tap"
                     " the nozzle by hand during a PROBE.")
-            # Best accuracy wins; the lower sigma breaks ties, since the spread
-            # is only the two extreme taps
-            measured.sort(key=lambda r: (round(r['spread'], 4), r['sigma']))
+            # Lowest average trigger height wins - the pair that felt the bed
+            # with the least travel past it. The spread breaks ties.
+            measured.sort(key=lambda r: (round(r['mean'], 4), r['spread']))
             best = measured[0]
             self.tap_thresh = best['thresh']
             self._write_tap_regs()
@@ -788,10 +795,10 @@ class ADXL345EndstopWrapper:
             gcmd.respond_info("ADXL_PROBE_CALIBRATE: results, best first")
             for rank, r in enumerate(measured):
                 gcmd.respond_info(
-                    "  %d. speed %5.1f  tap_thresh %6.0f  range %.4f"
-                    "  sigma %.4f  (%d taps)"
-                    % (rank + 1, r['speed'], r['thresh'], r['spread'],
-                       r['sigma'], r['samples']))
+                    "  %d. speed %5.1f  tap_thresh %6.0f  average z %.4f"
+                    "  range %.4f  sigma %.4f  (%d taps)"
+                    % (rank + 1, r['speed'], r['thresh'], r['mean'],
+                       r['spread'], r['sigma'], r['samples']))
         finally:
             self.managed_session = False
             self.cal_point = None
@@ -813,12 +820,14 @@ class ADXL345EndstopWrapper:
                        "%.0f" % (self.tap_thresh,))
         configfile.set(self.config_name, 'speed', "%g" % (best['speed'],))
         gcmd.respond_info(
-            "ADXL_PROBE_CALIBRATE: best accuracy was %.4f mm at speed %g with"
-            " tap_thresh %.0f. Both are applied now and staged for [%s]:\n"
+            "ADXL_PROBE_CALIBRATE: lowest average trigger height was %.4f mm"
+            " (range %.4f) at speed %g with tap_thresh %.0f. Both are applied"
+            " now and staged for [%s]:\n"
             "speed: %g\ntap_thresh: %.0f\n"
             "Run SAVE_CONFIG to keep them - it restarts Klipper."
-            % (best['spread'], best['speed'], self.tap_thresh,
+            % (best['mean'], best['spread'], best['speed'], self.tap_thresh,
                self.config_name, best['speed'], self.tap_thresh))
+
     # A print job in progress means the bed is occupied and the toolhead is
     # part way through someone's work. print_stats covers Moonraker-driven
     # prints, virtual_sdcard covers a file streamed by Klipper itself. A job
