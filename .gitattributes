@@ -1,0 +1,4 @@
+# Everything here is deployed to a Linux Klipper host, and install.sh checked
+# out with CRLF endings will not run there. Keep the working tree LF whatever
+# core.autocrlf is set to on the machine doing the clone.
+* text=auto eol=lf
