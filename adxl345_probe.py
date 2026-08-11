@@ -57,6 +57,7 @@ TUNE_Z = 10.  # height the search probes from
 TUNE_TRAVEL_SPEED = 50.  # mm/s for the move to the probing point
 TUNE_WINDOW = 16  # register steps searched around the previous speed's band
 TUNE_DEVIATION = 0.  # mm of X/Y scatter around the probing point, 0 = off
+TUNE_SCATTER_TRIES = 10  # draws before giving up on landing on a round bed
 
 # Probe failures that are a tuning result rather than a fault. Everything
 # else - an SPI readback mismatch, an MCU homing timeout, a shutdown - aborts
@@ -505,8 +506,15 @@ class ADXL345EndstopWrapper:
         point = self.tune_point
         if point is None or not point['dev']:
             return None, None
-        return (random.uniform(point['x_lo'], point['x_hi']),
-                random.uniform(point['y_lo'], point['y_hi']))
+        for _ in range(TUNE_SCATTER_TRIES):
+            x = random.uniform(point['x_lo'], point['x_hi'])
+            y = random.uniform(point['y_lo'], point['y_hi'])
+            if (point['radius2'] is None
+                    or x * x + y * y <= point['radius2']):
+                return x, y
+        # The corner of the square this point sits in is off a round bed. Tap
+        # the point that was asked for rather than one that cannot be reached.
+        return point['x'], point['y']
 
     # A probe attempt at a given THRESH_TAP register value is classified as:
     #   pass      - the probe descended past min_probe_travel and triggered
@@ -663,12 +671,15 @@ class ADXL345EndstopWrapper:
         y = gcmd.get_float('Y', center_y)
         dev = gcmd.get_float('TEST_TAP_DEVIATION', TUNE_DEVIATION, minval=0.)
         self.tune_point = self._scatter_area(gcmd, status, x, y, dev, travel)
-        # Lift before traversing: the nozzle may be sitting on the bed, or in
-        # a print, from whatever ran before this
-        if toolhead.get_position()[2] < z:
-            toolhead.manual_move([None, None, z], travel)
-        toolhead.manual_move([x, y, None], travel)
+        # Reach the probing height first, then traverse - never the other way
+        # round. On a delta the reachable radius collapses to nothing at the
+        # top of the travel, so traversing at the height G28 leaves the
+        # effector at is out of range for every point except the one homing
+        # ended on, which on a calibrated delta is not the middle of the bed.
+        # Z clears the bed by definition: it is the height every probe in the
+        # search descends from.
         toolhead.manual_move([None, None, z], travel)
+        toolhead.manual_move([x, y, None], travel)
         gcmd.respond_info("TEST_TAP_TUNE: probing at X%.3f Y%.3f from Z%.3f"
                           % (x, y, z))
         if dev:
@@ -703,7 +714,21 @@ class ADXL345EndstopWrapper:
                     " of the travel range - the probing area was clipped"
                     % (dev,))
         return {'x': x, 'y': y, 'dev': dev, 'speed': travel,
-                'x_lo': x_lo, 'x_hi': x_hi, 'y_lo': y_lo, 'y_hi': y_hi}
+                'x_lo': x_lo, 'x_hi': x_hi, 'y_lo': y_lo, 'y_hi': y_hi,
+                'radius2': self._round_bed_radius2(status)}
+
+    # Delta kinematics report the bounding square of a round bed, so a point
+    # inside the reported range can still be off the edge of what the effector
+    # can reach. A range symmetric about the origin in both axes, with the
+    # same reach either way, is that shape; treat it as a circle. Returns the
+    # squared radius, or None for a rectangular bed.
+    def _round_bed_radius2(self, status):
+        low, high = status.get('axis_minimum'), status.get('axis_maximum')
+        if low is None or high is None:
+            return None
+        if low.x != -high.x or low.y != -high.y or high.x != high.y:
+            return None
+        return high.x ** 2
 
     def _tune_speeds(self, gcmd):
         start = gcmd.get_float('SPEED_START', TUNE_SPEED_START, above=0.)

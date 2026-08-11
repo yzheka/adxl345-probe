@@ -340,7 +340,7 @@ Read this before running it:
 | --------- | ------- | ----------- |
 | `X` | middle of the bed | Where to probe. The default is the midpoint of the travel the kinematics report, less `x_offset`. |
 | `Y` | middle of the bed | As `X`, less `y_offset`. |
-| `Z` | `10` | Height each probe starts its descent from. Must clear anything on the bed. |
+| `Z` | `10` | Height each probe starts its descent from. Must clear anything on the bed. The move to the probing point also happens at this height — on a delta the reachable radius near the top of the travel is nil, so traversing at the height `G28` finishes at is out of range. |
 | `TEST_TAP_DEVIATION` | `0` | Half-width in mm of the square around `X`/`Y` the taps are scattered over. `0` taps the same spot every time. Anything above `0` picks a random point in `X±dev`, `Y±dev` before every probe, so a few hundred taps do not all land in one place. |
 | `TRAVEL_SPEED` | `50` | mm/s for the move to the probing point. Not the probing speed — that is what the command is measuring. |
 | `SPEED_START` | `2` | First probing speed in mm/s. |
@@ -417,7 +417,9 @@ TEST_TAP_TUNE TEST_TAP_DEVIATION=5
 ```
 
 The area is clipped to the travel the kinematics report, so a point near an
-edge still works — the square is just cut short, and the run says so.
+edge still works — the square is just cut short, and the run says so. On a
+delta, where the reported range is the square bounding a round bed, the taps
+are also kept inside the circle.
 
 The cost is that the scoring in step 2 no longer measures one spot. Bed tilt
 and unevenness across the area go straight into the Z spread the speeds are

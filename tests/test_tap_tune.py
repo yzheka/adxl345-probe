@@ -50,8 +50,8 @@ class Toolhead:
     def get_status(self, eventtime):
         return {'max_accel': self.max_accel,
                 'homed_axes': self.homed_axes,
-                'axis_minimum': Coord(x=0., y=0., z=0.),
-                'axis_maximum': Coord(x=300., y=220., z=250.)}
+                'axis_minimum': self.sim.axis_minimum,
+                'axis_maximum': self.sim.axis_maximum}
 
     def manual_move(self, coord, speed):
         for i, v in enumerate(coord):
@@ -329,6 +329,10 @@ class Sim:
         self.noise_step = 0
         self.trigger_z = 0.02
         self.z_min = -2.
+        # Cartesian travel by default. A delta reports the square that bounds
+        # its round bed, symmetric about the origin.
+        self.axis_minimum = Coord(x=0., y=0., z=0.)
+        self.axis_maximum = Coord(x=300., y=220., z=250.)
         self.tested = []
         # XY the toolhead was at for every descent
         self.probe_points = []
@@ -794,9 +798,12 @@ window_case()
 # --- positioning ------------------------------------------------------------
 
 def position_case(name, homed, params, want_xy, want_z, want_homing,
-                  start_pos=None, expect_error=None, home_result='xyz'):
+                  start_pos=None, expect_error=None, home_result='xyz',
+                  axis_range=None):
     import extras.adxl345_probe as mod
     sim = Sim(60, 200)
+    if axis_range is not None:
+        sim.axis_minimum, sim.axis_maximum = axis_range
     wrapper = build(sim, mod)
     sim.toolhead.homed_axes = homed
     sim.home_result = home_result
@@ -824,6 +831,13 @@ def position_case(name, homed, params, want_xy, want_z, want_homing,
     travel = sim.toolhead.moves[:3]
     print("  travel: %s" % [([round(c, 2) for c in p], sp)
                             for p, sp in travel])
+    # Z has to reach the probing height before anything traverses in XY. On a
+    # delta the reachable radius at the height G28 finishes at is nil, so a
+    # traverse up there is "Move out of range" for every point but one.
+    first_pos, _first_speed = sim.toolhead.moves[0]
+    assert round(first_pos[2], 3) == want_z, \
+        "first move went to z %.3f, not the probing height %s" \
+        % (first_pos[2], want_z)
     xy = [ln for ln in log if 'probing at' in ln]
     assert xy, "no probing point reported"
     print("  %s" % xy[0].strip())
@@ -852,12 +866,21 @@ position_case("nozzle starts on the bed - lifts before traversing", 'xyz',
               {}, (150.0, 110.0), 10.0, 0, start_pos=[5., 5., 0.2])
 position_case("G28 that does not home everything is an error", '', {}, None,
               None, 1, expect_error="G28 did not home", home_result='xy')
+# A delta homes at the top of the travel, where the reachable radius is nil.
+# The bed is centred on the origin, so the probing point is 0, 0.
+DELTA_RANGE = (Coord(x=-150., y=-150., z=-5.),
+               Coord(x=150., y=150., z=419.685))
+position_case("delta: descends before traversing", 'xyz', {},
+              (0.0, 0.0), 10.0, 0, start_pos=[0.31, -0.44, 419.685],
+              axis_range=DELTA_RANGE)
+position_case("delta: homes, then descends before traversing", '', {},
+              (0.0, 0.0), 10.0, 1, axis_range=DELTA_RANGE)
 
 
 # --- TEST_TAP_DEVIATION -----------------------------------------------------
 
 def deviation_case(name, params, want_area, expect_error=None,
-                   expect_clip=False):
+                   expect_clip=False, axis_range=None, want_radius=None):
     """Every tap must land inside the (clipped) square around the probing
     point, the taps must actually differ, and the nozzle must be at the start
     height before any traverse - dragging it across the bed at trigger height
@@ -866,6 +889,8 @@ def deviation_case(name, params, want_area, expect_error=None,
     import extras.adxl345_probe as mod
     random.seed(20250811)
     sim = Sim(60, 200)
+    if axis_range is not None:
+        sim.axis_minimum, sim.axis_maximum = axis_range
     wrapper = build(sim, mod)
     sim.toolhead.moves = []
     log = []
@@ -909,6 +934,14 @@ def deviation_case(name, params, want_area, expect_error=None,
         assert pos[2] >= start_z - 1e-9, \
             "moved to X%.3f Y%.3f at z %.3f, below the start height" \
             % (pos[0], pos[1], pos[2])
+    if want_radius is not None:
+        for x, y in points:
+            assert x * x + y * y <= want_radius ** 2 + 1e-9, \
+                "tapped X%.3f Y%.3f, off a bed of radius %g" \
+                % (x, y, want_radius)
+        print("  max radius %.3f of %g"
+              % (max((p[0] ** 2 + p[1] ** 2) ** .5 for p in points),
+                 want_radius))
     clipped = [ln for ln in log if 'was clipped' in ln]
     assert bool(clipped) == expect_clip, \
         "clip warning %s" % ("missing" if expect_clip else "unexpected")
@@ -926,6 +959,15 @@ deviation_case("area is clipped to the travel range",
 deviation_case("point outside the travel range is an error",
                {'X': 400, 'Y': 110, 'TEST_TAP_DEVIATION': 5}, None,
                expect_error="outside the travel range")
+deviation_case("delta: scatters around the centre",
+               {'TEST_TAP_DEVIATION': 5}, (-5., 5., -5., 5.),
+               axis_range=DELTA_RANGE, want_radius=150.)
+# The square around a point on the rim has corners off a round bed: the
+# reported range allows them, the reachable area does not
+deviation_case("delta: stays on a round bed at the rim",
+               {'X': 149, 'Y': 0, 'TEST_TAP_DEVIATION': 5},
+               (144., 150., -5., 5.), axis_range=DELTA_RANGE,
+               want_radius=150., expect_clip=True)
 
 
 # --- active print guard -----------------------------------------------------
