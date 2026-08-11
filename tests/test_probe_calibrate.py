@@ -1,11 +1,11 @@
-# Offline harness for TEST_TAP_TUNE.
+# Offline harness for ADXL_PROBE_CALIBRATE.
 #
-# Stubs enough of Klipper to drive cmd_TEST_TAP_TUNE against a simulated
+# Stubs enough of Klipper to drive cmd_ADXL_PROBE_CALIBRATE against a simulated
 # printer whose tap detection misfires below one register value and misses the
 # bed above another, with both edges moving as probing speed changes.
-# Verifies that the search lands on the true band at every speed, that the
-# scoring picks the most repeatable pair, and that faults abort rather than
-# being recorded as tuning verdicts.
+# Verifies that the threshold walk stops at the first setting that taps, that
+# the accuracy measurement picks the best speed, and that faults abort the run
+# rather than being recorded as tuning verdicts.
 import os
 import shutil
 import sys
@@ -111,6 +111,12 @@ class DescendHelper:
         if code < sensitive:
             # misfires on the start-of-move acceleration: no travel
             raise CommandError("Probe triggered prior to movement")
+        if code == sim.flaky_code:
+            # Works the first time, misfires after that: a threshold right on
+            # the edge of usable
+            sim.flaky_taps += 1
+            if sim.flaky_taps > 1:
+                raise CommandError("Probe triggered prior to movement")
         if code > deaf:
             th.pos[2] = sim.z_min
             raise CommandError("No trigger on probe after full movement")
@@ -336,6 +342,9 @@ class Sim:
         self.tested = []
         # XY the toolhead was at for every descent
         self.probe_points = []
+        # A register that taps once and misfires from then on
+        self.flaky_code = None
+        self.flaky_taps = 0
         self.fault = None
         self.fault_after = 3
         self.homing_calls = 0
@@ -388,7 +397,20 @@ def build(sim, mod, extra_config=None):
 
 
 SINGLE_SPEED = {'SPEED_START': 5, 'SPEED_END': 5, 'SPEED_STEP': 1,
-                'SAMPLES': 4}
+                'SAMPLES': 4, 'DEVIATION': 0}
+
+
+def walk_lands_on(wrapper, sensitive, deaf, lo=1000., hi=100000., step=1000.):
+    """The threshold the walk has to stop at: the first one it tries whose
+    register is at or above the misfire edge. None if that one already misses
+    the bed, which is the whole band gone."""
+    thresh = lo
+    while thresh <= hi + 1e-9:
+        code = wrapper._tap_code(thresh)
+        if code >= sensitive:
+            return None if code > deaf else thresh
+        thresh += step
+    return None
 
 
 def run(name, sensitive_edge, deaf_edge, params, expect_error=None):
@@ -402,49 +424,44 @@ def run(name, sensitive_edge, deaf_edge, params, expect_error=None):
     args = dict(SINGLE_SPEED)
     args.update(params)
     gcmd = GCmd(args, log)
-    print("\n=== %s (edge reg %d, deaf above %d) ==="
+    print("\n=== %s (misfires below reg %d, deaf above %d) ==="
           % (name, sensitive_edge, deaf_edge))
     try:
-        wrapper.cmd_TEST_TAP_TUNE(gcmd)
+        wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
     except CommandError as e:
         print("  ERROR: %s" % e)
         assert expect_error and expect_error in str(e), \
             "unexpected error: %s" % e
-        # an aborted search must leave the configured threshold untouched
+        # an aborted run must leave the configured threshold untouched
         assert sim.chip.regs[0x1D] == wrapper._tap_code(5000.), \
             "threshold not restored after abort: reg %d" % sim.chip.regs[0x1D]
-        assert not sim.configfile.saved, "aborted search wrote to the config"
+        assert not sim.configfile.saved, "aborted run staged config values"
         assert sim.configfile.save_config_calls == 0
         print("  -> expected error, config untouched, ok")
         return
     assert expect_error is None, "expected error %r, got success" % expect_error
-    reg = sim.chip.regs[0x1D]
-    saved = sim.configfile.saved.get(('adxl345_probe', 'tap_thresh'))
-    print("  probe attempts: %d, distinct codes: %d"
+    want = walk_lands_on(
+        wrapper, sensitive_edge, deaf_edge,
+        float(args.get('THRESHOLD_START', 1000.)),
+        float(args.get('THRESHOLD_END', 100000.)),
+        float(args.get('THRESHOLD_STEP', 1000.)))
+    assert want is not None, "the case itself expects no usable threshold"
+    staged = sim.configfile.saved.get(('adxl345_probe', 'tap_thresh'))
+    print("  taps: %d, thresholds tried: %d"
           % (len(sim.tested), len(set(c for _s, c in sim.tested))))
-    print("  final register: %d  saved: %s  SAVE_CONFIG: %d"
-          % (reg, saved, sim.configfile.save_config_calls))
-    margin = int(args.get('MARGIN', 2))
-    lo = int(float(args.get('THRESHOLD_START',
-                            args.get('THRESSHOLD_START', 10000.)))
-             / mod.TAP_SCALE)
-    hi = int(float(args.get('THRESHOLD_END',
-                            args.get('THRESSHOLD_END', 100000.)))
-             / mod.TAP_SCALE)
-    want = min(max(sensitive_edge, lo) + margin, min(deaf_edge, hi))
-    assert reg == want, "expected reg %d, got %d" % (want, reg)
-    if not int(args.get('SAVE', 1)):
-        # SAVE=0 must not stage anything: configfile.set() would leave
-        # save_config_pending set and break later SAVE_CONFIG calls
-        assert saved is None, "SAVE=0 still wrote %s" % saved
-        assert sim.configfile.save_config_calls == 0
-    else:
-        # the saved value must re-read to the same register on next boot
-        assert wrapper._tap_code(float(saved)) == reg, \
-            "saved %s re-reads as reg %d, not %d" \
-            % (saved, wrapper._tap_code(float(saved)), reg)
-        assert sim.configfile.saved[('adxl345_probe', 'speed')] == '5'
-        assert sim.configfile.save_config_calls == 1
+    print("  live reg: %d  staged: %s  SAVE_CONFIG calls: %d"
+          % (sim.chip.regs[0x1D], staged, sim.configfile.save_config_calls))
+    assert sim.chip.regs[0x1D] == wrapper._tap_code(want), \
+        "landed on reg %d, expected %d (tap_thresh %.0f)" \
+        % (sim.chip.regs[0x1D], wrapper._tap_code(want), want)
+    # Staged for the user's own SAVE_CONFIG, never written by the command
+    assert sim.configfile.save_config_calls == 0, "the command ran SAVE_CONFIG"
+    assert staged is not None, "nothing staged for SAVE_CONFIG"
+    assert wrapper._tap_code(float(staged)) == sim.chip.regs[0x1D], \
+        "staged %s re-reads as reg %d, not %d" \
+        % (staged, wrapper._tap_code(float(staged)), sim.chip.regs[0x1D])
+    assert sim.configfile.saved[('adxl345_probe', 'speed')] == '5'
+    assert wrapper.param_helper.speed == 5., "live speed not applied"
     print("  -> ok")
 
 
@@ -454,40 +471,61 @@ probe_stub.SampleAveragingHelper = object
 probe_stub.ProbeCommandHelper = object
 probe_stub.HomingViaProbeHelper = object
 
-run("edge just above start", 20, 200, {'SAVE': 1})
-run("edge mid range", 90, 200, {'SAVE': 1})
-run("edge near end", 160, 200, {'SAVE': 0})
-run("start already passes", 5, 200, {'SAVE': 0})
-run("deaf top, edge mid", 60, 100, {'SAVE': 0})
-run("zero margin", 77, 200, {'MARGIN': 0, 'SAVE': 0})
-run("whole range misfires", 250, 300, {'SAVE': 0},
+run("first threshold already taps", 1, 200, {})
+run("misfire edge just above the start", 3, 200, {})
+run("misfire edge mid range", 90, 200, {})
+run("misfire edge near the end", 160, 200, {})
+run("narrow band, one register wide", 60, 60, {})
+run("coarser threshold step", 90, 200, {'THRESHOLD_STEP': 5000})
+run("range given explicitly", 90, 200,
+    {'THRESHOLD_START': 40000, 'THRESHOLD_END': 80000})
+run("whole range misfires", 250, 300, {},
     expect_error="no speed produced a usable tap_thresh")
-run("nothing detects the bed", 5, 5, {'SAVE': 0},
+run("nothing detects the bed", 1, 0, {},
     expect_error="no speed produced a usable tap_thresh")
-# THRESSHOLD_* is the spelling the command shipped with. Macros written
-# against it have to keep working.
-run("range given as THRESHOLD_*", 90, 200,
-    {'THRESHOLD_START': 40000, 'THRESHOLD_END': 80000, 'SAVE': 0})
-run("range given as the old THRESSHOLD_*", 90, 200,
-    {'THRESSHOLD_START': 40000, 'THRESSHOLD_END': 80000, 'SAVE': 0})
 
 
 # --- defaults ---------------------------------------------------------------
 
-def default_speeds_case():
-    """The bare command's sweep, straight from the module defaults."""
+def defaults_case():
+    """The bare command's sweep and threshold ladder, from the module
+    defaults."""
     import extras.adxl345_probe as mod
     wrapper = build(Sim(60, 200), mod)
-    speeds = wrapper._tune_speeds(GCmd({}, [], quiet=True))
-    print("\n=== defaults: speed sweep ===")
-    print("  %s" % (", ".join("%g" % s for s in speeds),))
-    assert speeds[0] == 10., "starts at %g" % speeds[0]
-    assert speeds[-1] == 30., "ends at %g" % speeds[-1]
-    assert len(speeds) == 11, "%d speeds" % len(speeds)
+    gcmd = GCmd({}, [], quiet=True)
+    speeds = wrapper._speeds(gcmd)
+    thresholds = wrapper._thresholds(gcmd)
+    print("\n=== defaults ===")
+    print("  speeds: %s" % (", ".join("%g" % s for s in speeds),))
+    print("  thresholds: %g, %g, %g ... %g (%d of them)"
+          % (thresholds[0], thresholds[1], thresholds[2], thresholds[-1],
+             len(thresholds)))
+    assert (speeds[0], speeds[-1], len(speeds)) == (10., 30., 11), \
+        "speeds %s" % (speeds,)
+    assert thresholds[0] == 1000., "starts at %g" % thresholds[0]
+    assert thresholds[-1] <= 100000., "ends at %g" % thresholds[-1]
+    assert thresholds[1] - thresholds[0] == 1000., "step is not 1000"
+    assert wrapper._tap_code(1000.) == 1, "1000 mm/s^2 is not register 1"
     print("  -> ok")
 
 
-default_speeds_case()
+def dedupe_case():
+    """A step finer than one register (612.9 mm/s^2) would re-probe the same
+    chip setting, so those thresholds are dropped."""
+    import extras.adxl345_probe as mod
+    wrapper = build(Sim(60, 200), mod)
+    thresholds = wrapper._thresholds(
+        GCmd({'THRESHOLD_START': 1000, 'THRESHOLD_END': 4000,
+              'THRESHOLD_STEP': 100}, [], quiet=True))
+    codes = [wrapper._tap_code(t) for t in thresholds]
+    print("\n=== threshold ladder: 100 mm/s^2 step over 1000-4000 ===")
+    print("  %d thresholds, registers %s" % (len(thresholds), codes))
+    assert len(codes) == len(set(codes)), "the same register is probed twice"
+    print("  -> ok")
+
+
+defaults_case()
+dedupe_case()
 
 
 # --- disable_fans -----------------------------------------------------------
@@ -636,86 +674,78 @@ session_case("aborted probe (gcode:command_error)", abort_via='command_error')
 session_case("failure inside start_probe_session", break_startup=True)
 
 
-# --- exhaustive search property test ----------------------------------------
+# --- exhaustive walk property test ------------------------------------------
 
-def search_property_test(margin=2):
-    """For every reachable (misfire edge, deaf edge) pair, the command must
-    land on the true lowest working register plus the margin, or fail with the
-    error that matches the band it was given. Narrow bands are the interesting
-    ones - the walk stops at the first success and adds the margin without
-    probing it, so a band narrower than the margin has to be caught by the
-    accuracy run and fall back to the bare edge."""
+def walk_property_test(step=1000.):
+    """For every reachable (misfire edge, deaf edge) pair, the walk must stop
+    at the first threshold it tries that taps, or report that speed unusable.
+    Narrow bands are the interesting ones: a step of 1000 mm/s^2 advances the
+    register by one or two, so a one-register band can be stepped over."""
     import extras.adxl345_probe as mod
-    lo, hi = 16, 163
-    checked = failures = 0
-    for sensitive in range(lo - 4, hi + 4):
-        for deaf in range(lo - 4, hi + 4):
-            if deaf < sensitive - 1:
-                continue          # deafness always starts above misfiring
+    checked = failures = skipped = 0
+    for sensitive in range(0, 164, 1):
+        for deaf in range(max(0, sensitive - 2), 164, 5):
             sim = Sim(sensitive, deaf)
             wrapper = build(sim, mod)
             args = dict(SINGLE_SPEED)
-            args.update({'MARGIN': margin, 'SAVE': 0})
+            args['THRESHOLD_STEP'] = step
             gcmd = GCmd(args, [])
             gcmd.respond_info = lambda msg: None
-            band_low, band_high = max(sensitive, lo), min(deaf, hi)
+            want = walk_lands_on(wrapper, sensitive, deaf, step=step)
             checked += 1
             try:
-                wrapper.cmd_TEST_TAP_TUNE(gcmd)
+                wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
             except CommandError as e:
                 msg = str(e)
-                ok = (band_low > band_high
-                      and 'no speed produced a usable tap_thresh' in msg)
-                if not ok:
+                if want is None and 'no speed produced a usable' in msg:
+                    skipped += 1
+                else:
                     failures += 1
-                    print("  MISMATCH s=%d d=%d: %s" % (sensitive, deaf, msg))
+                    print("  MISMATCH s=%d d=%d: want %s, got %s"
+                          % (sensitive, deaf, want, msg))
                 continue
-            if band_low > band_high:
+            if want is None:
                 failures += 1
-                print("  MISMATCH s=%d d=%d: succeeded, band is empty"
+                print("  MISMATCH s=%d d=%d: succeeded with no usable band"
                       % (sensitive, deaf))
                 continue
-            # The margin is added unprobed; if it lands past the top of the
-            # band the accuracy run fails and the edge itself is used
-            want = min(band_low + margin, hi)
-            if want > band_high:
-                want = band_low
             got = sim.chip.regs[0x1D]
-            if got != want:
+            if got != wrapper._tap_code(want):
                 failures += 1
                 print("  MISMATCH s=%d d=%d: got reg %d, want %d"
-                      % (sensitive, deaf, got, want))
+                      % (sensitive, deaf, got, wrapper._tap_code(want)))
             # the nozzle must never be left parked at the descent floor
             if sim.toolhead.pos[2] <= sim.z_min:
                 failures += 1
                 print("  MISMATCH s=%d d=%d: left at z %.3f"
                       % (sensitive, deaf, sim.toolhead.pos[2]))
-    print("\n=== search property test: %d bands, MARGIN=%d ==="
-          % (checked, margin))
+    print("\n=== walk property test: %d bands, THRESHOLD_STEP=%g ==="
+          % (checked, step))
+    print("  %d had no usable threshold and were reported as such" % skipped)
     assert not failures, "%d mismatches" % failures
     print("  -> ok")
 
 
-search_property_test(margin=2)
-search_property_test(margin=0)
+walk_property_test(step=1000.)
+walk_property_test(step=613.)
+walk_property_test(step=5000.)
 
 
 # --- error classification ---------------------------------------------------
 
 def classification_case(name, error_text, expect_abort):
-    """A fault must abort the search, not be recorded as a tuning verdict."""
+    """A fault must abort the run, not be recorded as a tuning verdict."""
     import extras.adxl345_probe as mod
     sim = Sim(60, 200)
     sim.fault = error_text
     wrapper = build(sim, mod)
     log = []
     args = dict(SINGLE_SPEED)
-    args['SAVE'] = 0
     gcmd = GCmd(args, log)
     gcmd.respond_info = lambda msg: log.append(msg)
     print("\n=== classification: %s ===" % name)
     try:
-        wrapper.cmd_TEST_TAP_TUNE(gcmd)
+        wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
         msg = "completed"
     except CommandError as e:
         msg = str(e)
@@ -745,7 +775,7 @@ classification_case("genuine misfire", "ADXL345 probe triggered after only"
                     " 0.000mm of travel (minimum 0.500mm)", False)
 
 
-# --- multi-speed tuning -----------------------------------------------------
+# --- multi-speed measurement ------------------------------------------------
 
 def speed_case(name, bands, noise, want_speed, want_reg, params=None,
                expect_error=None):
@@ -756,12 +786,12 @@ def speed_case(name, bands, noise, want_speed, want_reg, params=None,
     wrapper = build(sim, mod)
     log = []
     args = {'SPEED_START': 2, 'SPEED_END': 8, 'SPEED_STEP': 2,
-            'SAMPLES': 4, 'SAVE': 1}
+            'SAMPLES': 4, 'DEVIATION': 0}
     args.update(params or {})
     gcmd = GCmd(args, log, quiet=True)
     print("\n=== speeds: %s ===" % name)
     try:
-        wrapper.cmd_TEST_TAP_TUNE(gcmd)
+        wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
     except CommandError as e:
         assert expect_error and expect_error in str(e), \
             "unexpected error: %s" % e
@@ -770,8 +800,8 @@ def speed_case(name, bands, noise, want_speed, want_reg, params=None,
         return
     assert expect_error is None, "expected error %r" % expect_error
     for line in log:
-        if line.startswith("TEST_TAP_TUNE: results") or line.startswith("  1."):
-            print("  %s" % line.strip())
+        if line.startswith("  1.") or 'best accuracy' in line:
+            print("  %s" % line.strip().split("\n")[0])
     got_speed = float(sim.configfile.saved[('adxl345_probe', 'speed')])
     got_reg = sim.chip.regs[0x1D]
     assert got_speed == want_speed, \
@@ -779,33 +809,35 @@ def speed_case(name, bands, noise, want_speed, want_reg, params=None,
     assert got_reg == want_reg, "picked reg %d, expected %d" % (got_reg,
                                                                 want_reg)
     assert wrapper.param_helper.speed == want_speed, "live speed not applied"
-    probes_by_speed = {}
+    taps_by_speed = {}
     for sp, _c in sim.tested:
-        probes_by_speed[sp] = probes_by_speed.get(sp, 0) + 1
-    print("  probes per speed: %s" % probes_by_speed)
+        taps_by_speed[sp] = taps_by_speed.get(sp, 0) + 1
+    print("  taps per speed: %s" % taps_by_speed)
     print("  -> picked speed %g, reg %d, ok" % (got_speed, got_reg))
 
 
-# Band drifts upward with speed (a faster tap hits harder, so it takes a
-# higher threshold to stop misfiring); 4 mm/s is the most repeatable.
+# The band drifts upward with speed - a faster tap hits harder, so it takes a
+# higher threshold to stop misfiring. 4 mm/s is the most repeatable. The
+# registers come from the 1000 mm/s^2 ladder, so they are the first rung at or
+# above each misfire edge.
 DRIFT = {2.0: (20, 40), 4.0: (26, 50), 6.0: (34, 62), 8.0: (44, 78)}
-speed_case("repeatability picks the winner", DRIFT,
-           {2.0: 0.020, 4.0: 0.004, 6.0: 0.012, 8.0: 0.030}, 4.0, 28)
+speed_case("accuracy picks the winner", DRIFT,
+           {2.0: 0.020, 4.0: 0.004, 6.0: 0.012, 8.0: 0.030}, 4.0, 26)
 
-# Same bands, but two speeds tie on spread - both scatter over 0.010. The
-# lower sigma breaks it: 6 mm/s clusters around the middle, 4 mm/s sits at the
-# two extremes. Both offset cycles are 4 long and SAMPLES is 4, so every
-# scoring run sees one whole cycle whatever the phase.
+# Two speeds tie on spread - both scatter over 0.010. The lower sigma breaks
+# it: 6 mm/s clusters around the middle, 4 mm/s sits at the two extremes. Both
+# offset cycles are 4 long and SAMPLES is 4, so every measurement sees one
+# whole cycle whatever the phase.
 speed_case("sigma breaks a tie on spread", DRIFT,
            {2.0: 0.020,
             4.0: (-0.005, 0.005, -0.005, 0.005),
             6.0: (-0.005, 0.0, 0.005, 0.0),
-            8.0: 0.030}, 6.0, 36)
+            8.0: 0.030}, 6.0, 34)
 
-# One speed has no usable band at all - it is skipped, not fatal
-speed_case("a speed with no usable band is skipped",
+# One speed has no usable threshold at all - it is skipped, not fatal
+speed_case("a speed with no usable threshold is skipped",
            {2.0: (20, 40), 4.0: (60, 55), 6.0: (34, 62), 8.0: (44, 78)},
-           {2.0: 0.030, 4.0: 0.001, 6.0: 0.008, 8.0: 0.020}, 6.0, 36)
+           {2.0: 0.030, 4.0: 0.001, 6.0: 0.008, 8.0: 0.020}, 6.0, 34)
 
 # No speed works at all
 speed_case("no speed works",
@@ -814,33 +846,112 @@ speed_case("no speed works",
            expect_error="no speed produced a usable tap_thresh")
 
 
-def window_case():
-    """The carried-over floor must not hide a band that moved: the walk starts
-    just below the previous speed's edge, and a band that drifted far above it
-    still has to be found in full."""
+def restart_case():
+    """Every speed starts the walk over at THRESHOLD_START, so a band that
+    moved a long way up is still found - and one that moved down is not
+    missed."""
     import extras.adxl345_probe as mod
-    bands = {2.0: (20, 40), 4.0: (120, 150)}
+    bands = {2.0: (120, 150), 4.0: (20, 40)}
     sim = Sim(60, 200, bands=bands, noise={2.0: 0.02, 4.0: 0.01})
     wrapper = build(sim, mod)
     log = []
     gcmd = GCmd({'SPEED_START': 2, 'SPEED_END': 4, 'SPEED_STEP': 2,
-                 'SAMPLES': 4, 'SAVE': 0, 'WINDOW': 4}, log, quiet=True)
-    print("\n=== speeds: band moves far above the carried floor ===")
-    wrapper.cmd_TEST_TAP_TUNE(gcmd)
-    lines = [ln for ln in log if 'works from reg' in ln]
-    for ln in lines:
+                 'SAMPLES': 4, 'DEVIATION': 0}, log, quiet=True)
+    print("\n=== speeds: the band moves down between speeds ===")
+    wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
+    for ln in log:
+        if 'taps, range' in ln:
+            print("  %s" % ln.strip())
+    # Both walks start at reg 1 (1000 mm/s^2), whatever the previous speed did
+    for speed in (2.0, 4.0):
+        first = [c for sp, c in sim.tested if sp == speed][0]
+        assert first == wrapper._tap_code(1000.), \
+            "%g mm/s started at reg %d" % (speed, first)
+    # 4 mm/s is both more accurate and lower in the range
+    assert sim.chip.regs[0x1D] == 21, "reg %d" % sim.chip.regs[0x1D]
+    assert float(sim.configfile.saved[('adxl345_probe', 'speed')]) == 4.
+    print("  -> both walks restarted at 1000 mm/s^2, ok")
+
+
+restart_case()
+
+
+def accuracy_lift_case():
+    """The accuracy taps lift LIFT mm between them, not back to Z, and the
+    walk taps once at each threshold before that."""
+    import extras.adxl345_probe as mod
+    sim = Sim(28, 200)
+    wrapper = build(sim, mod)
+    sim.toolhead.moves = []
+    log = []
+    gcmd = GCmd({'SPEED_START': 5, 'SPEED_END': 5, 'SPEED_STEP': 1,
+                 'SAMPLES': 5, 'DEVIATION': 0}, log, quiet=True)
+    print("\n=== accuracy run: 1 mm lifts ===")
+    wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
+    lifts = [round(pos[2], 4) for pos, _sp in sim.toolhead.moves]
+    print("  lift targets: %s" % lifts)
+    # One tap per misfiring threshold from the start height, then the accuracy
+    # run just above the bed
+    assert lifts.count(10.0) >= 2, "walk did not descend from Z10: %s" % lifts
+    near_bed = [z for z in lifts if z < 5.]
+    assert len(near_bed) >= 3, "no 1 mm lifts: %s" % lifts
+    for z in near_bed:
+        assert 1.0 <= z <= 1.1, "lifted to %.4f, expected ~1 mm" % z
+    print("  -> %d taps from ~1 mm, %d from Z10, ok"
+          % (len(near_bed), lifts.count(10.0)))
+
+
+accuracy_lift_case()
+
+
+def lift_guard_case():
+    """A LIFT at or below min_probe_travel would make every accuracy tap look
+    like a misfire, so it is refused up front."""
+    import extras.adxl345_probe as mod
+    sim = Sim(28, 200)
+    wrapper = build(sim, mod)
+    log = []
+    gcmd = GCmd({'SPEED_START': 5, 'SPEED_END': 5, 'LIFT': 0.4}, log,
+                quiet=True)
+    print("\n=== accuracy run: LIFT below min_probe_travel ===")
+    try:
+        wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
+    except CommandError as e:
+        print("  ERROR: %s" % e)
+        assert 'min_probe_travel' in str(e), "unexpected error: %s" % e
+        assert not sim.tested, "%d taps ran anyway" % len(sim.tested)
+        print("  -> refused before tapping, ok")
+        return
+    raise AssertionError("LIFT=0.4 with min_probe_travel=0.5 was accepted")
+
+
+lift_guard_case()
+
+
+def intermittent_case():
+    """A threshold that taps once but breaks down during the accuracy run is
+    not good enough: the walk carries on up instead of failing the speed."""
+    import extras.adxl345_probe as mod
+    sim = Sim(28, 200)
+    # The first rung of the 1000 mm/s^2 ladder at or above the misfire edge is
+    # 18000 mm/s^2, register 29. Make that one work once and then misfire.
+    sim.flaky_code = 29
+    wrapper = build(sim, mod)
+    log = []
+    gcmd = GCmd({'SPEED_START': 5, 'SPEED_END': 5, 'SPEED_STEP': 1,
+                 'SAMPLES': 4, 'DEVIATION': 0}, log, quiet=True)
+    print("\n=== accuracy run: flaky threshold ===")
+    wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
+    raised = [ln for ln in log if 'raising tap_thresh' in ln]
+    for ln in raised:
         print("  %s" % ln.strip())
-    assert any('works from reg 20,' in ln for ln in lines), "2 mm/s edge wrong"
-    assert any('works from reg 120,' in ln for ln in lines), \
-        "4 mm/s edge not found above the carried floor"
-    assert sim.chip.regs[0x1D] == 122, "reg %d" % sim.chip.regs[0x1D]
-    # The 4 mm/s walk starts at 20 - WINDOW, not at the bottom of the range
-    starts = sorted(c for sp, c in sim.tested if sp == 4.0)
-    assert starts[0] == 16, "4 mm/s walk started at reg %d" % starts[0]
-    print("  -> both edges found, walk started from the carried floor, ok")
+    assert raised, "the flaky threshold was not reported"
+    assert sim.chip.regs[0x1D] > 28, \
+        "kept the flaky threshold (reg %d)" % sim.chip.regs[0x1D]
+    print("  -> walked past it to reg %d, ok" % sim.chip.regs[0x1D])
 
 
-window_case()
+intermittent_case()
 
 
 # --- positioning ------------------------------------------------------------
@@ -860,12 +971,11 @@ def position_case(name, homed, params, want_xy, want_z, want_homing,
     sim.toolhead.moves = []
     log = []
     args = dict(SINGLE_SPEED)
-    args.update({'SAVE': 0})
     args.update(params)
     gcmd = GCmd(args, log, quiet=True)
     print("\n=== positioning: %s ===" % name)
     try:
-        wrapper.cmd_TEST_TAP_TUNE(gcmd)
+        wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
     except CommandError as e:
         assert expect_error and expect_error in str(e), \
             "unexpected error: %s" % e
@@ -889,13 +999,14 @@ def position_case(name, homed, params, want_xy, want_z, want_homing,
     xy = [ln for ln in log if 'probing at' in ln]
     assert xy, "no probing point reported"
     print("  %s" % xy[0].strip())
-    got_x = float(xy[0].split('X')[1].split()[0])
-    got_y = float(xy[0].split('Y')[1].split()[0])
-    got_z = float(xy[0].split('Z')[1].split()[0])
+    # Parse after "probing at", not by splitting on X/Y/Z - the command name
+    # itself has an X in it
+    fields = xy[0].split('probing at ')[1].replace('from ', '').split()
+    got_x, got_y, got_z = (float(f[1:]) for f in fields[:3])
     assert (round(got_x, 3), round(got_y, 3)) == want_xy, \
         "went to X%.3f Y%.3f, expected %s" % (got_x, got_y, (want_xy,))
     assert round(got_z, 3) == want_z, "Z%.3f, expected %s" % (got_z, want_z)
-    # every probe in the search must start from that Z
+    # the run must end back at that Z
     assert sim.toolhead.pos[2] == want_z, \
         "finished at z %.3f" % sim.toolhead.pos[2]
     print("  -> ok")
@@ -925,14 +1036,15 @@ position_case("delta: homes, then descends before traversing", '', {},
               (0.0, 0.0), 10.0, 1, axis_range=DELTA_RANGE)
 
 
-# --- TEST_TAP_DEVIATION -----------------------------------------------------
+# --- DEVIATION -----------------------------------------------------
 
 def deviation_case(name, params, want_area, expect_error=None,
-                   expect_clip=False, axis_range=None, want_radius=None):
+                   expect_clip=False, axis_range=None, want_radius=None,
+                   use_default=False):
     """Every tap must land inside the (clipped) square around the probing
-    point, the taps must actually differ, and the nozzle must be at the start
-    height before any traverse - dragging it across the bed at trigger height
-    would do exactly the damage the deviation exists to avoid."""
+    point, the taps must actually differ, and the nozzle must be clear of the
+    bed before any traverse - dragging it sideways at trigger height would do
+    exactly the damage the deviation exists to avoid."""
     import random
     import extras.adxl345_probe as mod
     random.seed(20250811)
@@ -943,12 +1055,13 @@ def deviation_case(name, params, want_area, expect_error=None,
     sim.toolhead.moves = []
     log = []
     args = dict(SINGLE_SPEED)
-    args['SAVE'] = 0
     args.update(params)
+    if use_default:
+        del args['DEVIATION']
     gcmd = GCmd(args, log, quiet=True)
     print("\n=== deviation: %s ===" % name)
     try:
-        wrapper.cmd_TEST_TAP_TUNE(gcmd)
+        wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
     except CommandError as e:
         assert expect_error and expect_error in str(e), \
             "unexpected error: %s" % e
@@ -976,12 +1089,17 @@ def deviation_case(name, params, want_area, expect_error=None,
         assert distinct == 1, "%d distinct points, expected one spot" \
             % (distinct,)
     # Descents are not commanded moves, so every recorded move is a lift or a
-    # traverse: none of them may happen below the start height
-    start_z = float(params.get('Z', 10))
+    # traverse. A traverse may only happen with the nozzle lifted clear: the
+    # accuracy run works LIFT mm above the bed, so that is the floor.
+    lift = float(args.get('LIFT', 1.))
+    prev = None
     for pos, _speed in sim.toolhead.moves:
-        assert pos[2] >= start_z - 1e-9, \
-            "moved to X%.3f Y%.3f at z %.3f, below the start height" \
-            % (pos[0], pos[1], pos[2])
+        if prev is not None and (round(pos[0], 6), round(pos[1], 6)) \
+                != (round(prev[0], 6), round(prev[1], 6)):
+            assert pos[2] >= lift - 1e-9, \
+                "traversed to X%.3f Y%.3f at z %.3f, below the %g mm lift" \
+                % (pos[0], pos[1], pos[2], lift)
+        prev = pos
     if want_radius is not None:
         for x, y in points:
             assert x * x + y * y <= want_radius ** 2 + 1e-9, \
@@ -998,22 +1116,25 @@ def deviation_case(name, params, want_area, expect_error=None,
     print("  -> ok")
 
 
-deviation_case("default taps one spot", {}, (150., 150., 110., 110.))
+deviation_case("DEVIATION=0 taps one spot", {}, (150., 150., 110., 110.))
+# The module default is 20 mm, so a bare command scatters
+deviation_case("the 20 mm default scatters", {}, (130., 170., 90., 130.),
+               use_default=True)
 deviation_case("DEVIATION=5 scatters around the centre",
-               {'TEST_TAP_DEVIATION': 5}, (145., 155., 105., 115.))
+               {'DEVIATION': 5}, (145., 155., 105., 115.))
 deviation_case("area is clipped to the travel range",
-               {'X': 2, 'Y': 3, 'TEST_TAP_DEVIATION': 5},
+               {'X': 2, 'Y': 3, 'DEVIATION': 5},
                (0., 7., 0., 8.), expect_clip=True)
 deviation_case("point outside the travel range is an error",
-               {'X': 400, 'Y': 110, 'TEST_TAP_DEVIATION': 5}, None,
+               {'X': 400, 'Y': 110, 'DEVIATION': 5}, None,
                expect_error="outside the travel range")
 deviation_case("delta: scatters around the centre",
-               {'TEST_TAP_DEVIATION': 5}, (-5., 5., -5., 5.),
+               {'DEVIATION': 5}, (-5., 5., -5., 5.),
                axis_range=DELTA_RANGE, want_radius=150.)
 # The square around a point on the rim has corners off a round bed: the
 # reported range allows them, the reachable area does not
 deviation_case("delta: stays on a round bed at the rim",
-               {'X': 149, 'Y': 0, 'TEST_TAP_DEVIATION': 5},
+               {'X': 149, 'Y': 0, 'DEVIATION': 5},
                (144., 150., -5., 5.), axis_range=DELTA_RANGE,
                want_radius=150., expect_clip=True)
 
@@ -1044,11 +1165,10 @@ def print_guard_case(name, objects, expect_blocked):
     sim.toolhead.moves = []
     log = []
     args = dict(SINGLE_SPEED)
-    args['SAVE'] = 1
     gcmd = GCmd(args, log, quiet=True)
     print("\n=== print guard: %s ===" % name)
     # must never raise: an error inside an SD print aborts the print
-    wrapper.cmd_TEST_TAP_TUNE(gcmd)
+    wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
     warned = [ln for ln in log if 'not starting' in ln]
     if expect_blocked:
         assert warned, "no warning printed"

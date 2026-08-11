@@ -10,11 +10,13 @@
 #                       move only, restored afterwards
 #   rest_time         - settle dwell before arming / after disarming tap
 #                       detection (upstream hardcodes 0.1s each way)
-#   TEST_TAP_TUNE     - sweeps probing speed, walks up to the lowest working
-#                       tap_thresh at each one, scores the pairs by probe
-#                       repeatability, and saves the winner, optionally
-#                       scattering the taps over an area so the search does
-#                       not dent one spot of the bed
+#   ADXL_PROBE_CALIBRATE
+#                     - walks tap_thresh up to the lowest value that taps at
+#                       each probing speed, measures probe accuracy there, and
+#                       keeps the most accurate pair. Only the accuracy runs
+#                       touch the bed: a threshold too low to work misfires
+#                       before the effector has descended, and the taps are
+#                       scattered over an area so a run does not dent one spot
 #   disable_fans      - works with every fan section type, not only the ones
 #                       that happen to expose a fan_speed attribute
 #
@@ -43,22 +45,20 @@ ADXL345_REST_TIME = .1
 # configured value to 100000 mm/s**2 (register 163) - keep one constant for it
 TAP_THRESH_MAX = 100000.
 
-# TEST_TAP_TUNE defaults
-TUNE_THRESHOLD_START = 10000.
-TUNE_THRESHOLD_END = 100000.
-TUNE_SPEED_START = 10.
-TUNE_SPEED_END = 30.
-TUNE_SPEED_STEP = 2.
-TUNE_MAX_SPEEDS = 20
-TUNE_TRIALS = 1  # probes per candidate on the way up; 1 stops at the first
-TUNE_SAMPLES = 10
-TUNE_MARGIN = 2  # register steps of headroom probed above the edge
-TUNE_THRESHOLD_STEP = 1  # register steps the walk up to the band takes
-TUNE_Z = 10.  # height the search probes from
-TUNE_TRAVEL_SPEED = 50.  # mm/s for the move to the probing point
-TUNE_WINDOW = 16  # registers below the last edge the next walk starts at
-TUNE_DEVIATION = 0.  # mm of X/Y scatter around the probing point, 0 = off
-TUNE_SCATTER_TRIES = 10  # draws before giving up on landing on a round bed
+# ADXL_PROBE_CALIBRATE defaults
+CAL_THRESHOLD_START = 1000.
+CAL_THRESHOLD_END = 100000.
+CAL_THRESHOLD_STEP = 1000.  # mm/s**2 added after a misfire
+CAL_SPEED_START = 10.
+CAL_SPEED_END = 30.
+CAL_SPEED_STEP = 2.
+CAL_MAX_SPEEDS = 20
+CAL_SAMPLES = 10  # taps per accuracy measurement
+CAL_LIFT = 1.  # mm the nozzle rises between those taps
+CAL_Z = 10.  # height the first tap of each threshold descends from
+CAL_TRAVEL_SPEED = 50.  # mm/s for the move to the probing point
+CAL_DEVIATION = 20.  # mm of X/Y scatter around the probing point, 0 = off
+CAL_SCATTER_TRIES = 10  # draws before giving up on landing on a round bed
 
 # Probe failures that are a tuning result rather than a fault. Everything
 # else - an SPI readback mismatch, an MCU homing timeout, a shutdown - aborts
@@ -136,8 +136,8 @@ class ADXL345EndstopWrapper:
         self.is_measuring = False
         self.in_session = False
         self.managed_session = False
-        # Probing area TEST_TAP_TUNE works in, set up when it starts
-        self.tune_point = None
+        # Probing area ADXL_PROBE_CALIBRATE works in, set up when it starts
+        self.cal_point = None
         self.printer.register_event_handler('klippy:connect', self._init_adxl)
         self.printer.register_event_handler('gcode:command_error',
                                             self._handle_command_error)
@@ -148,8 +148,8 @@ class ADXL345EndstopWrapper:
         # value up in the registered values.
         commands = [('SET_ACCEL_PROBE', self.cmd_SET_ACCEL_PROBE,
                      self.cmd_SET_ACCEL_PROBE_help),
-                    ('TEST_TAP_TUNE', self.cmd_TEST_TAP_TUNE,
-                     self.cmd_TEST_TAP_TUNE_help)]
+                    ('ADXL_PROBE_CALIBRATE', self.cmd_ADXL_PROBE_CALIBRATE,
+                     self.cmd_ADXL_PROBE_CALIBRATE_help)]
         for name, func, desc in commands:
             for key in (self.chip_name, None):
                 gcode.register_mux_command(name, 'CHIP', key, func, desc=desc)
@@ -447,7 +447,7 @@ class ADXL345EndstopWrapper:
     # own handler to fire.
     def _handle_command_error(self):
         if self.managed_session:
-            # TEST_TAP_TUNE owns this session and ends it in its own
+            # ADXL_PROBE_CALIBRATE owns this session and ends it in its own
             # finally. A macro in activate_gcode can raise - and therefore
             # fire this event - without the sweep being over; powering the
             # accelerometer down underneath it would make every remaining
@@ -479,35 +479,36 @@ class ADXL345EndstopWrapper:
                              "none" if self.probe_accel is None
                              else "%.0f" % (self.probe_accel,)))
 
-    cmd_TEST_TAP_TUNE_help = (
-        "Find the best probing speed and tap_thresh pair")
+    cmd_ADXL_PROBE_CALIBRATE_help = (
+        "Measure probe accuracy across probing speeds and keep the best"
+        " speed / tap_thresh pair")
 
-    # Raised when a threshold range contains no usable value. Distinct from
-    # command_error so the caller can widen the search and try again, while a
-    # real fault still propagates.
-    class NoBand(Exception):
+    # Raised when no threshold in the range works at a given speed. Distinct
+    # from command_error so the run can skip that speed while a real fault
+    # still propagates.
+    class NoThreshold(Exception):
         pass
 
-    # Return the toolhead to the height the search started from. Called after
-    # a failed trial too: a 'deaf' probe ran the move to its end, which leaves
-    # the nozzle loaded against the bed at the descent floor.
-    def _lift_to(self, start_z, lift_speed):
+    # Return the toolhead to a height it can traverse and descend from again.
+    # Called after a failed tap too: a probe that missed the bed ran its move
+    # to the end, which leaves the nozzle loaded against the bed at the
+    # descent floor.
+    def _lift_to(self, z, lift_speed):
         try:
             toolhead = self.printer.lookup_object('toolhead')
-            toolhead.manual_move([None, None, start_z], lift_speed)
+            toolhead.manual_move([None, None, z], lift_speed)
         except Exception:
-            logging.exception("adxl345_probe: cannot lift to %.3f", start_z)
+            logging.exception("adxl345_probe: cannot lift to %.3f", z)
 
-    # A tuning run taps the bed several hundred times, and every tap is the
-    # nozzle hitting it. TEST_TAP_DEVIATION spreads those taps over a square
-    # of that half-width around the probing point instead of driving them all
-    # into one spot. Returns (None, None) when it is off, so the toolhead is
-    # left where it is and the move is skipped entirely.
+    # Every tap is the nozzle hitting the bed. DEVIATION spreads them over a
+    # square of that half-width around the probing point instead of driving
+    # them all into one spot. Returns (None, None) when it is off, so the
+    # toolhead is left where it is and the move is skipped entirely.
     def _probe_xy(self):
-        point = self.tune_point
+        point = self.cal_point
         if point is None or not point['dev']:
             return None, None
-        for _ in range(TUNE_SCATTER_TRIES):
+        for _ in range(CAL_SCATTER_TRIES):
             x = random.uniform(point['x_lo'], point['x_hi'])
             y = random.uniform(point['y_lo'], point['y_hi'])
             if (point['radius2'] is None
@@ -517,101 +518,257 @@ class ADXL345EndstopWrapper:
         # the point that was asked for rather than one that cannot be reached.
         return point['x'], point['y']
 
-    # A probe attempt at a given THRESH_TAP register value is classified as:
-    #   pass      - the probe descended past min_probe_travel and triggered
-    #   sensitive - it misfired (tap latched while arming, or triggered on the
-    #               start-of-move acceleration): the threshold is too low
-    #   deaf      - the move ran to the end without a trigger: too high
-    # Returns (verdict, detail, trigger positions).
-    def _test_tap_code(self, probe_gcmd, code, trials, start_z, lift_speed):
+    # One tap, from `from_z`, at a random point if DEVIATION is set. Classified
+    # as:
+    #   pass      - descended past min_probe_travel and triggered
+    #   sensitive - misfired (tap latched while arming, or triggered on the
+    #               start-of-move acceleration): tap_thresh is too low
+    #   deaf      - the move ran to its end without triggering: too high
+    # Returns (verdict, detail, trigger z or None).
+    def _tap(self, probe_gcmd, from_z, lift_speed, safe_z):
         toolhead = self.printer.lookup_object('toolhead')
-        self.tap_thresh = self._code_thresh(code)
-        self._write_tap_regs()
-        zs = []
-        for _ in range(trials):
-            # Lift first: the previous probe left the nozzle at the bed, and
-            # traversing from there would drag it across the surface
-            toolhead.manual_move([None, None, start_z], lift_speed)
-            x, y = self._probe_xy()
-            if x is not None:
-                toolhead.manual_move([x, y, None], self.tune_point['speed'])
-            self.homing_helper.clear_trigger_positions()
-            try:
-                self.run_probe(probe_gcmd)
-            except self.printer.command_error as e:
-                msg = str(e)
-                if any(t in msg for t in PROBE_DEAF_ERRORS):
-                    # The move ran to the descent floor - get off the bed
-                    self._lift_to(start_z, lift_speed)
-                    return 'deaf', msg, zs
-                if any(t in msg for t in PROBE_SENSITIVE_ERRORS):
-                    return 'sensitive', msg, zs
-                # Anything else is a fault, not a verdict: an SPI readback
-                # mismatch, an MCU homing timeout, a shutdown, a move out of
-                # range. Recording it as 'sensitive' would abort the search
-                # blaming the threshold.
+        # Lift before traversing: the last tap left the nozzle on the bed, and
+        # moving in XY from there would drag it across the surface
+        toolhead.manual_move([None, None, from_z], lift_speed)
+        x, y = self._probe_xy()
+        if x is not None:
+            toolhead.manual_move([x, y, None], self.cal_point['speed'])
+        self.homing_helper.clear_trigger_positions()
+        try:
+            self.run_probe(probe_gcmd)
+        except self.printer.command_error as e:
+            msg = str(e)
+            if any(t in msg for t in PROBE_DEAF_ERRORS):
+                # The move ran to the descent floor - get off the bed
+                self._lift_to(safe_z, lift_speed)
+                return 'deaf', msg, None
+            if any(t in msg for t in PROBE_SENSITIVE_ERRORS):
+                return 'sensitive', msg, None
+            # Anything else is a fault, not a verdict: an SPI readback
+            # mismatch, an MCU homing timeout, a shutdown, a move out of
+            # range. Recording it as a verdict would blame tap_thresh for it.
+            self._lift_to(safe_z, lift_speed)
+            raise
+        try:
+            positions = self.homing_helper.pull_trigger_positions()
+        except Exception:
+            positions = None
+        z = positions[-1][2] if positions else None
+        return 'pass', ("triggered at z %.4f" % (z,) if z is not None
+                        else "triggered, no position reported"), z
+
+    # The sequence of thresholds tried at each speed, in mm/s**2. Values that
+    # land on a THRESH_TAP register already tried are dropped: the register is
+    # 612.9 mm/s**2 per step, so a step finer than that would re-probe the
+    # same setting.
+    def _thresholds(self, gcmd):
+        lo = gcmd.get_float('THRESHOLD_START', CAL_THRESHOLD_START,
+                            minval=TAP_SCALE, maxval=TAP_THRESH_MAX)
+        hi = gcmd.get_float('THRESHOLD_END', CAL_THRESHOLD_END,
+                            minval=TAP_SCALE, maxval=TAP_THRESH_MAX)
+        step = gcmd.get_float('THRESHOLD_STEP', CAL_THRESHOLD_STEP, above=0.)
+        if hi < lo:
+            raise gcmd.error("THRESHOLD_END must not be below THRESHOLD_START")
+        out, seen, thresh = [], set(), lo
+        while thresh <= hi + 1e-9:
+            code = self._tap_code(thresh)
+            if code not in seen:
+                seen.add(code)
+                out.append(thresh)
+            thresh += step
+        return out
+
+    # The probing speeds to measure, in mm/s
+    def _speeds(self, gcmd):
+        start = gcmd.get_float('SPEED_START', CAL_SPEED_START, above=0.)
+        end = gcmd.get_float('SPEED_END', CAL_SPEED_END, above=0.)
+        step = gcmd.get_float('SPEED_STEP', CAL_SPEED_STEP, above=0.)
+        if end < start:
+            raise gcmd.error("SPEED_END must not be below SPEED_START")
+        out, speed = [], start
+        while speed <= end + 1e-9:
+            out.append(round(speed, 6))
+            speed += step
+            if len(out) > CAL_MAX_SPEEDS:
+                raise gcmd.error(
+                    "SPEED_START/SPEED_END/SPEED_STEP asks for more than %d"
+                    " speeds. Raise SPEED_STEP or narrow the range."
+                    % (CAL_MAX_SPEEDS,))
+        return out
+
+    # Walk tap_thresh up until a tap works, then measure how repeatable that
+    # tap is. A threshold too low misfires before the effector has descended -
+    # one probe, no bed contact - so walking up from the sensitive end is what
+    # keeps the bed intact. Returns the accuracy measurement for this speed.
+    def _measure_speed(self, gcmd, probe_gcmd, speed, thresholds, samples,
+                       lift, start_z, lift_speed):
+        for thresh in thresholds:
+            self.tap_thresh = thresh
+            self._write_tap_regs()
+            verdict, detail, z = self._tap(probe_gcmd, start_z, lift_speed,
+                                           start_z)
+            gcmd.respond_info(
+                "  speed %5.1f  tap_thresh %6.0f (reg %3d): %-9s %s"
+                % (speed, thresh, self._tap_code(thresh), verdict, detail))
+            if verdict == 'deaf':
+                # Nothing higher can be more sensitive than this was
+                raise self.NoThreshold(
+                    "tap_thresh %.0f already misses the bed" % (thresh,))
+            if verdict == 'sensitive':
+                continue
+            # It tapped. Measure the accuracy of that pair, lifting `lift` mm
+            # between taps rather than returning to the start height.
+            zs = [] if z is None else [z]
+            from_z = (z if z is not None
+                      else self.printer.lookup_object(
+                          'toolhead').get_position()[2]) + lift
+            failed = None
+            for _ in range(samples - len(zs)):
+                verdict, detail, z = self._tap(probe_gcmd, from_z, lift_speed,
+                                               start_z)
+                if verdict != 'pass':
+                    failed = (verdict, detail)
+                    break
+                if z is not None:
+                    zs.append(z)
+                    from_z = z + lift
+            if failed is None and len(zs) >= 2:
+                spread = max(zs) - min(zs)
+                mean = sum(zs) / len(zs)
+                sigma = math.sqrt(sum((v - mean) ** 2 for v in zs)
+                                  / len(zs))
+                gcmd.respond_info(
+                    "  speed %5.1f  tap_thresh %6.0f: %d taps, range %.4f"
+                    " sigma %.4f" % (speed, thresh, len(zs), spread, sigma))
                 self._lift_to(start_z, lift_speed)
-                raise
-            try:
-                positions = self.homing_helper.pull_trigger_positions()
-            except Exception:
-                positions = None
-            if positions:
-                zs.append(positions[-1][2])
-        if not zs:
-            return 'pass', "triggered, no position reported", zs
-        return 'pass', ("z min %.4f max %.4f range %.4f"
-                        % (min(zs), max(zs), max(zs) - min(zs))), zs
+                return {'speed': speed, 'thresh': thresh, 'spread': spread,
+                        'sigma': sigma, 'samples': len(zs)}
+            # The accuracy run broke down, so this threshold only works
+            # intermittently. Carry on up.
+            self._lift_to(start_z, lift_speed)
+            if failed is not None and failed[0] == 'deaf':
+                raise self.NoThreshold(
+                    "tap_thresh %.0f misses the bed part way through the"
+                    " accuracy run" % (thresh,))
+            gcmd.respond_info(
+                "  speed %5.1f  tap_thresh %6.0f: only %d of %d taps worked"
+                " (%s) - raising tap_thresh"
+                % (speed, thresh, len(zs), samples,
+                   failed[1] if failed else "no trigger position reported"))
+        raise self.NoThreshold(
+            "every tap_thresh from %.0f to %.0f mm/s^2 misfired"
+            % (thresholds[0], thresholds[-1]))
 
-    # Probe, fail, raise tap_thresh, probe again - until it stops misfiring.
-    # Returns the first value that did not, its verdict, and the last value
-    # that did misfire; (None, None, last) if everything up to `hi` misfires.
-    def _walk_up(self, test, lo, hi, step):
-        code = below = lo
-        while True:
-            verdict = test(code)
-            if verdict != 'sensitive':
-                return code, verdict, below
-            if code >= hi:
-                return None, None, below
-            below, code = code, min(code + step, hi)
+    def cmd_ADXL_PROBE_CALIBRATE(self, gcmd):
+        # Refuse before parsing anything, and refuse by returning rather than
+        # raising: an error raised inside an SD print aborts the print
+        # (virtual_sdcard breaks out of its work loop on gcode.error), which
+        # is exactly what this guard exists to avoid.
+        busy = self._active_print()
+        if busy is not None:
+            gcmd.respond_info(
+                "!! ADXL_PROBE_CALIBRATE: not starting - %s. This command"
+                " homes the toolhead, drives to the middle of the bed and taps"
+                " it a few hundred times, which would wreck the print. Run it"
+                " when the printer is idle. Nothing has been changed."
+                % (busy,))
+            return
+        thresholds = self._thresholds(gcmd)
+        speeds = self._speeds(gcmd)
+        samples = gcmd.get_int('SAMPLES', CAL_SAMPLES, minval=2, maxval=100)
+        lift = gcmd.get_float('LIFT', CAL_LIFT, above=0.)
+        if lift <= self.min_probe_travel:
+            # Every tap of the accuracy run would trigger inside
+            # min_probe_travel and be read as a misfire, so the walk would
+            # climb to the top of the range and report the machine unusable.
+            raise gcmd.error(
+                "ADXL_PROBE_CALIBRATE: LIFT=%.3f is not above"
+                " min_probe_travel=%.3f, so every tap of the accuracy run"
+                " would look like a misfire. Raise LIFT."
+                % (lift, self.min_probe_travel))
+        start_z = self._move_to_probe_point(gcmd)
+        lift_speed = self.param_helper.get_probe_params(gcmd)['lift_speed']
+        saved_thresh = self.tap_thresh
+        saved_speed = getattr(self.param_helper, 'speed', None)
+        gcode = self.printer.lookup_object('gcode')
+        base_params = dict(gcmd.get_command_parameters())
+        # One probe per run_probe call - the averaging helper is not in this
+        # path, this module's own session is
+        base_params['SAMPLES'] = '1'
+        keep = False
+        measured = []
 
-    # The lowest register value that works. The chip stores the threshold at
-    # 612.9 mm/s**2 per step, so the search runs over register steps - anything
-    # finer would re-test the same register.
-    #
-    # The walk goes upwards from `lo`, `step` registers at a time: probe, fail,
-    # raise tap_thresh, probe again, and stop at the first success. That is
-    # what keeps the bed intact. A threshold too low to work misfires before
-    # the effector has descended - one probe, no contact - whereas a threshold
-    # too high does not stop at the bed at all and drives the nozzle down to
-    # the descent floor. Searching from the insensitive end, or probing on past
-    # the first success, means paying that price for nothing.
-    def _find_edge(self, test, lo, hi, step):
-        edge, verdict, below = self._walk_up(test, lo, hi, step)
-        if edge is None:
-            raise self.NoBand(
-                "tap_thresh %.0f (the top of the range) still misfires"
-                % (self._code_thresh(hi),))
-        if verdict == 'deaf' and edge - below > 1:
-            # A step wider than one register can walk over a narrow band.
-            # Go back and try every register the walk skipped.
-            fine, fine_verdict, fine_below = self._walk_up(
-                test, below + 1, edge - 1, 1)
-            if fine is not None:
-                edge, verdict, below = fine, fine_verdict, fine_below
-        if verdict != 'pass':
-            if edge == lo:
-                # Nothing above lo can be more sensitive than lo is
-                raise self.NoBand(
-                    "nothing in %.0f - %.0f mm/s^2 detected the bed"
-                    % (self._code_thresh(lo), self._code_thresh(hi)))
-            raise self.NoBand(
-                "%.0f already misfires and %.0f, the next value tried,"
-                " misses the bed"
-                % (self._code_thresh(below), self._code_thresh(edge)))
-        return edge
+        gcmd.respond_info(
+            "ADXL_PROBE_CALIBRATE: speeds %s mm/s, tap_thresh %.0f - %.0f"
+            " mm/s^2 in %d step(s), %d taps per measurement. Every speed"
+            " starts over at %.0f mm/s^2."
+            % (", ".join("%g" % s for s in speeds), thresholds[0],
+               thresholds[-1], len(thresholds), samples, thresholds[0]))
 
+        self.start_probe_session(gcmd)
+        self.managed_session = True
+        try:
+            for speed in speeds:
+                params = dict(base_params)
+                params['PROBE_SPEED'] = "%.6f" % (speed,)
+                probe_gcmd = gcode.create_gcode_command("", "", params)
+                try:
+                    measured.append(self._measure_speed(
+                        gcmd, probe_gcmd, speed, thresholds, samples, lift,
+                        start_z, lift_speed))
+                except self.NoThreshold as e:
+                    gcmd.respond_info("  speed %5.1f: unusable - %s"
+                                      % (speed, e))
+            if not measured:
+                raise gcmd.error(
+                    "ADXL_PROBE_CALIBRATE: no speed produced a usable"
+                    " tap_thresh. Lower probe_accel, check the wiring with"
+                    " QUERY_PROBE, and confirm the probe triggers when you tap"
+                    " the nozzle by hand during a PROBE.")
+            # Best accuracy wins; the lower sigma breaks ties, since the spread
+            # is only the two extreme taps
+            measured.sort(key=lambda r: (round(r['spread'], 4), r['sigma']))
+            best = measured[0]
+            self.tap_thresh = best['thresh']
+            self._write_tap_regs()
+            if saved_speed is not None:
+                self.param_helper.speed = best['speed']
+            keep = True
+            self._lift_to(start_z, lift_speed)
+            gcmd.respond_info("ADXL_PROBE_CALIBRATE: results, best first")
+            for rank, r in enumerate(measured):
+                gcmd.respond_info(
+                    "  %d. speed %5.1f  tap_thresh %6.0f  range %.4f"
+                    "  sigma %.4f  (%d taps)"
+                    % (rank + 1, r['speed'], r['thresh'], r['spread'],
+                       r['sigma'], r['samples']))
+        finally:
+            self.managed_session = False
+            self.cal_point = None
+            if not keep:
+                # Best effort: an SPI fault here must not replace the error
+                # that actually stopped the run, nor skip the teardown
+                self.tap_thresh = saved_thresh
+                try:
+                    self._write_tap_regs()
+                except Exception:
+                    logging.exception("adxl345_probe: cannot restore"
+                                      " tap_thresh")
+                self._lift_to(start_z, lift_speed)
+            self.end_probe_session()
+        # Staged, not written: SAVE_CONFIG is the user's call, and it restarts
+        # Klipper. The values are live in the meantime.
+        configfile = self.printer.lookup_object('configfile')
+        configfile.set(self.config_name, 'tap_thresh',
+                       "%.0f" % (self.tap_thresh,))
+        configfile.set(self.config_name, 'speed', "%g" % (best['speed'],))
+        gcmd.respond_info(
+            "ADXL_PROBE_CALIBRATE: best accuracy was %.4f mm at speed %g with"
+            " tap_thresh %.0f. Both are applied now and staged for [%s]:\n"
+            "speed: %g\ntap_thresh: %.0f\n"
+            "Run SAVE_CONFIG to keep them - it restarts Klipper."
+            % (best['spread'], best['speed'], self.tap_thresh,
+               self.config_name, best['speed'], self.tap_thresh))
     # A print job in progress means the bed is occupied and the toolhead is
     # part way through someone's work. print_stats covers Moonraker-driven
     # prints, virtual_sdcard covers a file streamed by Klipper itself. A job
@@ -652,48 +809,49 @@ class ADXL345EndstopWrapper:
 
     # Home if needed and travel to the probing point, so the command is
     # usable on its own without a G28/G1 preamble. Returns the Z it settled
-    # at, which is the height every probe in the search starts from.
+    # at, which is the height the first tap at each threshold descends from.
     def _move_to_probe_point(self, gcmd):
         toolhead = self.printer.lookup_object('toolhead')
-        z = gcmd.get_float('Z', TUNE_Z, above=0.)
-        travel = gcmd.get_float('TRAVEL_SPEED', TUNE_TRAVEL_SPEED, above=0.)
+        z = gcmd.get_float('Z', CAL_Z, above=0.)
+        travel = gcmd.get_float('TRAVEL_SPEED', CAL_TRAVEL_SPEED, above=0.)
         reactor = self.printer.get_reactor()
         status = toolhead.get_status(reactor.monotonic())
         if not all(a in status['homed_axes'] for a in 'xyz'):
-            gcmd.respond_info("TEST_TAP_TUNE: homing first")
+            gcmd.respond_info("ADXL_PROBE_CALIBRATE: homing first")
             self.printer.lookup_object('gcode').run_script_from_command("G28")
             status = toolhead.get_status(reactor.monotonic())
             if not all(a in status['homed_axes'] for a in 'xyz'):
-                raise gcmd.error("TEST_TAP_TUNE: G28 did not home X, Y and Z")
+                raise gcmd.error("ADXL_PROBE_CALIBRATE: G28 did not home X,"
+                                 " Y and Z")
         center_x, center_y = self._bed_center(status)
         if center_x is None and (gcmd.get('X', None) is None
                                  or gcmd.get('Y', None) is None):
             raise gcmd.error(
-                "TEST_TAP_TUNE: the kinematics do not report a travel range,"
-                " so the middle of the bed cannot be worked out. Pass X= and"
-                " Y= explicitly.")
+                "ADXL_PROBE_CALIBRATE: the kinematics do not report a travel"
+                " range, so the middle of the bed cannot be worked out. Pass"
+                " X= and Y= explicitly.")
         x = gcmd.get_float('X', center_x)
         y = gcmd.get_float('Y', center_y)
-        dev = gcmd.get_float('TEST_TAP_DEVIATION', TUNE_DEVIATION, minval=0.)
-        self.tune_point = self._scatter_area(gcmd, status, x, y, dev, travel)
+        dev = gcmd.get_float('DEVIATION', CAL_DEVIATION, minval=0.)
+        self.cal_point = self._scatter_area(gcmd, status, x, y, dev, travel)
         # Reach the probing height first, then traverse - never the other way
         # round. On a delta the reachable radius collapses to nothing at the
         # top of the travel, so traversing at the height G28 leaves the
         # effector at is out of range for every point except the one homing
         # ended on, which on a calibrated delta is not the middle of the bed.
-        # Z clears the bed by definition: it is the height every probe in the
-        # search descends from.
+        # Z clears the bed by definition: it is the height the run descends
+        # from.
         toolhead.manual_move([None, None, z], travel)
         toolhead.manual_move([x, y, None], travel)
-        gcmd.respond_info("TEST_TAP_TUNE: probing at X%.3f Y%.3f from Z%.3f"
-                          % (x, y, z))
+        gcmd.respond_info("ADXL_PROBE_CALIBRATE: probing at X%.3f Y%.3f from"
+                          " Z%.3f" % (x, y, z))
         if dev:
-            area = self.tune_point
+            area = self.cal_point
             gcmd.respond_info(
-                "TEST_TAP_TUNE: scattering the taps over X%.3f-%.3f"
-                " Y%.3f-%.3f (TEST_TAP_DEVIATION=%g). Any tilt or unevenness"
-                " across that area lands in the repeatability numbers, so"
-                " keep it small enough that the bed is flat within it."
+                "ADXL_PROBE_CALIBRATE: scattering the taps over X%.3f-%.3f"
+                " Y%.3f-%.3f (DEVIATION=%g). Any tilt or unevenness across"
+                " that area lands in the measured accuracy, so keep it small"
+                " enough that the bed is flat within it."
                 % (area['x_lo'], area['x_hi'], area['y_lo'], area['y_hi'],
                    dev))
         return z
@@ -711,11 +869,11 @@ class ADXL345EndstopWrapper:
             y_lo, y_hi = max(y_lo, low.y), min(y_hi, high.y)
             if x_lo > x_hi or y_lo > y_hi:
                 raise gcmd.error(
-                    "TEST_TAP_TUNE: X%.3f Y%.3f is outside the travel range,"
-                    " so no probing area fits around it" % (x, y))
+                    "ADXL_PROBE_CALIBRATE: X%.3f Y%.3f is outside the travel"
+                    " range, so no probing area fits around it" % (x, y))
             if (x_hi - x_lo < 2 * dev) or (y_hi - y_lo < 2 * dev):
                 gcmd.respond_info(
-                    "TEST_TAP_TUNE: TEST_TAP_DEVIATION=%g runs off the edge"
+                    "ADXL_PROBE_CALIBRATE: DEVIATION=%g runs off the edge"
                     " of the travel range - the probing area was clipped"
                     % (dev,))
         return {'x': x, 'y': y, 'dev': dev, 'speed': travel,
@@ -734,227 +892,6 @@ class ADXL345EndstopWrapper:
         if low.x != -high.x or low.y != -high.y or high.x != high.y:
             return None
         return high.x ** 2
-
-    def _tune_speeds(self, gcmd):
-        start = gcmd.get_float('SPEED_START', TUNE_SPEED_START, above=0.)
-        end = gcmd.get_float('SPEED_END', TUNE_SPEED_END, above=0.)
-        step = gcmd.get_float('SPEED_STEP', TUNE_SPEED_STEP, above=0.)
-        if end < start:
-            raise gcmd.error("SPEED_END must not be below SPEED_START")
-        speeds = []
-        speed = start
-        while speed <= end + 1e-9:
-            speeds.append(round(speed, 6))
-            speed += step
-            if len(speeds) > TUNE_MAX_SPEEDS:
-                raise gcmd.error(
-                    "SPEED_START/SPEED_END/SPEED_STEP asks for more than %d"
-                    " speeds. Raise SPEED_STEP or narrow the range."
-                    % (TUNE_MAX_SPEEDS,))
-        return speeds
-
-    def cmd_TEST_TAP_TUNE(self, gcmd):
-        # Refuse before parsing anything, and refuse by returning rather than
-        # raising: an error raised inside an SD print aborts the print
-        # (virtual_sdcard breaks out of its work loop on gcode.error), which
-        # is exactly what this guard exists to avoid.
-        busy = self._active_print()
-        if busy is not None:
-            gcmd.respond_info(
-                "!! TEST_TAP_TUNE: not starting - %s. This command homes the"
-                " toolhead, drives to the middle of the bed and taps it a few"
-                " hundred times, which would wreck the print. Run it when the"
-                " printer is idle. Nothing has been changed." % (busy,))
-            return
-        # THRESSHOLD_* is the spelling this command shipped with. Still
-        # accepted so existing macros keep working, but nothing says it.
-        lo_thresh = gcmd.get_float(
-            'THRESHOLD_START',
-            gcmd.get_float('THRESSHOLD_START', TUNE_THRESHOLD_START,
-                           minval=TAP_SCALE, maxval=TAP_THRESH_MAX),
-            minval=TAP_SCALE, maxval=TAP_THRESH_MAX)
-        hi_thresh = gcmd.get_float(
-            'THRESHOLD_END',
-            gcmd.get_float('THRESSHOLD_END', TUNE_THRESHOLD_END,
-                           minval=TAP_SCALE, maxval=TAP_THRESH_MAX),
-            minval=TAP_SCALE, maxval=TAP_THRESH_MAX)
-        speeds = self._tune_speeds(gcmd)
-        trials = gcmd.get_int('TRIALS', TUNE_TRIALS, minval=1, maxval=20)
-        samples = gcmd.get_int('SAMPLES', TUNE_SAMPLES, minval=2, maxval=100)
-        margin = gcmd.get_int('MARGIN', TUNE_MARGIN, minval=0, maxval=32)
-        thresh_step = gcmd.get_int('THRESHOLD_STEP', TUNE_THRESHOLD_STEP,
-                                   minval=1, maxval=64)
-        window = gcmd.get_int('WINDOW', TUNE_WINDOW, minval=0, maxval=255)
-        save = gcmd.get_int('SAVE', 1, minval=0, maxval=1)
-        lo = self._tap_code(lo_thresh)
-        hi = self._tap_code(hi_thresh)
-        if hi <= lo:
-            raise gcmd.error("THRESHOLD_END must be at least one register"
-                             " step (%.0f mm/s^2) above THRESHOLD_START"
-                             % (TAP_SCALE,))
-        start_z = self._move_to_probe_point(gcmd)
-        lift_speed = self.param_helper.get_probe_params(gcmd)['lift_speed']
-        saved_thresh = self.tap_thresh
-        saved_speed = getattr(self.param_helper, 'speed', None)
-        gcode = self.printer.lookup_object('gcode')
-        base_params = dict(gcmd.get_command_parameters())
-        # One probe per run_probe call - the averaging helper is not in this
-        # path, this module's own session is
-        base_params['SAMPLES'] = '1'
-        keep = False
-        scored = []
-
-        gcmd.respond_info(
-            "TEST_TAP_TUNE: speeds %s mm/s, tap_thresh %.0f - %.0f mm/s^2"
-            " (reg %d - %d), %d probe(s) per candidate, %d sample(s) per"
-            " speed. Roughly %d-%d probes - this takes a while."
-            % (", ".join("%g" % s for s in speeds), self._code_thresh(lo),
-               self._code_thresh(hi), lo, hi, trials, samples,
-               len(speeds) * (samples + trials),
-               len(speeds) * (samples + trials + window * trials)
-               + (hi - lo) * trials))
-
-        self.start_probe_session(gcmd)
-        self.managed_session = True
-        try:
-            search_lo = lo
-            for speed in speeds:
-                params = dict(base_params)
-                params['PROBE_SPEED'] = "%.6f" % (speed,)
-                probe_gcmd = gcode.create_gcode_command("", "", params)
-                results = {}
-
-                def test(code, _pg=probe_gcmd, _res=results):
-                    if code in _res:
-                        return _res[code][0]
-                    verdict, detail, _zs = self._test_tap_code(
-                        _pg, code, trials, start_z, lift_speed)
-                    _res[code] = (verdict, detail)
-                    gcmd.respond_info(
-                        "  speed %5.1f  tap_thresh %6.0f (reg %3d): %-9s %s"
-                        % (speed, self._code_thresh(code), code, verdict,
-                           detail))
-                    return verdict
-
-                try:
-                    edge = self._find_edge(test, search_lo, hi, thresh_step)
-                except self.NoBand as e:
-                    if search_lo == lo:
-                        gcmd.respond_info("  speed %5.1f: unusable - %s"
-                                          % (speed, e))
-                        continue
-                    # The floor carried over from the previous speed started
-                    # too high. Walk the whole range before giving up on it.
-                    gcmd.respond_info(
-                        "  speed %5.1f: nothing from the carried-over floor"
-                        " up (%s) - starting from the bottom" % (speed, e))
-                    search_lo = lo
-                    try:
-                        edge = self._find_edge(test, lo, hi, thresh_step)
-                    except self.NoBand as e2:
-                        gcmd.respond_info("  speed %5.1f: unusable - %s"
-                                          % (speed, e2))
-                        continue
-                # The walk started above the bottom of the band, so the real
-                # bottom may be below the carried-over floor. Walk up from the
-                # bottom of the range to find it - misfires cost one probe
-                # each and never touch the bed.
-                if edge == search_lo and search_lo > lo:
-                    edge = self._find_edge(test, lo, hi, thresh_step)
-                # The accuracy run is the only thing that taps more than once,
-                # and it runs at the value being recommended, so no separate
-                # verification of the margin is needed.
-                candidate = min(edge + margin, hi)
-                verdict, detail, zs = self._test_tap_code(
-                    probe_gcmd, candidate, samples, start_z, lift_speed)
-                if (verdict != 'pass' or len(zs) < 2) and candidate != edge:
-                    # The margin landed past the top of the band. Fall back to
-                    # the edge, which is the value that just passed.
-                    gcmd.respond_info(
-                        "  speed %5.1f  tap_thresh %6.0f: %s - dropping the"
-                        " %d step margin"
-                        % (speed, self._code_thresh(candidate), detail,
-                           margin))
-                    candidate = edge
-                    verdict, detail, zs = self._test_tap_code(
-                        probe_gcmd, candidate, samples, start_z, lift_speed)
-                if verdict != 'pass' or len(zs) < 2:
-                    gcmd.respond_info(
-                        "  speed %5.1f  tap_thresh %6.0f: failed the"
-                        " accuracy run (%s) - discarded"
-                        % (speed, self._code_thresh(candidate), detail))
-                    continue
-                spread = max(zs) - min(zs)
-                mean = sum(zs) / len(zs)
-                sigma = math.sqrt(sum((z - mean) ** 2 for z in zs) / len(zs))
-                scored.append({'speed': speed, 'code': candidate,
-                               'edge': edge, 'spread': spread,
-                               'sigma': sigma, 'samples': len(zs)})
-                gcmd.respond_info(
-                    "  speed %5.1f  tap_thresh %6.0f (reg %3d): works from reg"
-                    " %d, %d samples, range %.4f sigma %.4f"
-                    % (speed, self._code_thresh(candidate), candidate,
-                       edge, len(zs), spread, sigma))
-                # Start the next speed's walk just below this band instead of
-                # at the bottom of the range. The band moves with speed, but
-                # not usually far, and this is where most of the probes go.
-                search_lo = max(lo, edge - window)
-            if not scored:
-                raise gcmd.error(
-                    "TEST_TAP_TUNE: no speed produced a usable tap_thresh."
-                    " Lower probe_accel, check the wiring with QUERY_PROBE,"
-                    " and confirm the probe triggers when you tap the nozzle"
-                    " by hand during a PROBE.")
-            # Best repeatability wins; the lower sigma breaks ties, since the
-            # spread is only the two extremes of the samples. The width of the
-            # working band would be the better tiebreak, but measuring it
-            # means probing until the bed is missed.
-            scored.sort(key=lambda r: (round(r['spread'], 4), r['sigma']))
-            best = scored[0]
-            self.tap_thresh = self._code_thresh(best['code'])
-            self._write_tap_regs()
-            if saved_speed is not None:
-                self.param_helper.speed = best['speed']
-            keep = True
-            self._lift_to(start_z, lift_speed)
-            gcmd.respond_info("TEST_TAP_TUNE: results, best first")
-            for rank, r in enumerate(scored):
-                gcmd.respond_info(
-                    "  %d. speed %5.1f  tap_thresh %6.0f  range %.4f"
-                    "  sigma %.4f  works from reg %d"
-                    % (rank + 1, r['speed'], self._code_thresh(r['code']),
-                       r['spread'], r['sigma'], r['edge']))
-        finally:
-            self.managed_session = False
-            self.tune_point = None
-            if not keep:
-                # Best effort: an SPI fault here must not replace the error
-                # that actually stopped the search, nor skip the teardown
-                self.tap_thresh = saved_thresh
-                try:
-                    self._write_tap_regs()
-                except Exception:
-                    logging.exception("adxl345_probe: cannot restore"
-                                      " tap_thresh")
-                self._lift_to(start_z, lift_speed)
-            self.end_probe_session()
-        gcmd.respond_info("TEST_TAP_TUNE: put this in [%s]:\n"
-                          "speed: %g\ntap_thresh: %.0f"
-                          % (self.config_name, best['speed'], self.tap_thresh))
-        if not save:
-            # Deliberately not staged with configfile.set(): that sets
-            # save_config_pending, and if [adxl345_probe] lives in an included
-            # file every later SAVE_CONFIG - including one from
-            # BED_MESH_CALIBRATE - would then fail with an include conflict
-            gcmd.respond_info("TEST_TAP_TUNE: active for this session only,"
-                              " nothing written")
-            return
-        configfile = self.printer.lookup_object('configfile')
-        configfile.set(self.config_name, 'tap_thresh',
-                       "%.0f" % (self.tap_thresh,))
-        configfile.set(self.config_name, 'speed', "%g" % (best['speed'],))
-        gcmd.respond_info("TEST_TAP_TUNE: saving and restarting")
-        gcode.run_script_from_command("SAVE_CONFIG")
 
 
 # Main external probe interface - mirrors probe.PrinterProbe
