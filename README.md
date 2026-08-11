@@ -378,10 +378,12 @@ tap latches only after the effector has pressed in far enough for the chip to
 see it, so the reported position sits below the nominal plane. A smaller
 distance is a probe that felt the bed sooner, with less deflection.
 
-An accuracy worse than `ACCURACY_MAX` (0.1 mm) is not a measurement of the bed
-at all — the tap is latching on something other than the contact, or the
-effector is deflecting that far first. That threshold is treated as unusable and
-the walk carries on upward, exactly as it does for a misfire.
+The running average is checked after every tap, and an accuracy worse than
+`ACCURACY_MAX` (0.1 mm) is not a measurement of the bed at all — the tap is
+latching on something other than the contact, or the effector is deflecting that
+far first. The rest of the sequence is abandoned there and then, and the walk
+carries on upward exactly as it does for a misfire. A disqualified threshold
+costs one tap, not `SAMPLES` of them.
 
 The spread and sigma are reported alongside the average.
 
@@ -620,7 +622,7 @@ no threshold in the range worked there, the run says so and carries on.
 | `only N of M taps worked - raising tap_thresh` | Not a failure: that threshold is marginal, and the walk is carrying on upward. |
 | `probe fault, step failed: ...` | Not fatal: that rung is abandoned and the walk carries on. The quoted message is the real cause. |
 | `N probe faults in a row, so this is not a passing glitch - stopping` | The same fault on `N` consecutive taps. The quoted message is what to fix — a `probe_pin` polarity or pullup problem shows up like this. |
-| `accuracy X is worse than Y - raising tap_thresh` | The taps triggered further than `ACCURACY_MAX` from zero, so they measured deflection rather than the bed. Also not fatal — the walk carries on up. |
+| `accuracy X is worse than Y after N tap(s) - raising tap_thresh` | The running average went past `ACCURACY_MAX`, so the taps were measuring deflection rather than the bed. Not fatal — the rest of the sequence is skipped and the walk carries on up. |
 | `LIFT=x is not above min_probe_travel=y` | The accuracy taps would trigger inside `min_probe_travel` and be read as misfires. Leave `LIFT` out and it defaults to twice `min_probe_travel`. |
 
 ### Running during a print

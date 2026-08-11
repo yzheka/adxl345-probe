@@ -1046,7 +1046,14 @@ def accuracy_ceiling_case():
         "%d thresholds rejected, expected 5" % len(rejected)
     assert sim.chip.regs[0x1D] == 25, \
         "kept reg %d, expected 25" % sim.chip.regs[0x1D]
-    print("  -> walked past all five, kept reg %d" % sim.chip.regs[0x1D])
+    # one tap each for the five that were out, then the full four at reg 25
+    taps = [c for _sp, c in sim.tested]
+    for code in sim.deep_codes:
+        assert taps.count(code) == 1, \
+            "reg %d cost %d taps, expected 1" % (code, taps.count(code))
+    assert taps.count(25) == 4, "reg 25 got %d taps" % taps.count(25)
+    print("  -> walked past all five at one tap each, kept reg %d"
+          % sim.chip.regs[0x1D])
     # And with the ceiling raised, the first one is good enough
     sim2 = Sim(20, 200)
     sim2.deep_codes = dict(sim.deep_codes)

@@ -731,40 +731,49 @@ class ADXL345EndstopWrapper:
                     "  tap %-4s speed %5.1f  tap_thresh %6.0f  %s"
                     % ("#%d:" % (ordinal,), _s, _t, detail))
 
+            # Triggering further than `worst` from the bed is not a measurement
+            # of anything: the tap is latching on something other than the
+            # contact, or the effector is deflecting that far before the chip
+            # sees it. Checked after every tap, so a threshold that is already
+            # out stops costing bed contacts as soon as that is known rather
+            # than at the end of the sequence.
+            def too_far(_w=worst):
+                return abs(sum(zs) / len(zs)) > _w if zs else False
+
             report(1)
             from_z = (z if z is not None
                       else self.printer.lookup_object(
                           'toolhead').get_position()[2]) + lift
             failed = None
-            for n in range(2, samples + 1):
-                verdict, detail, z = self._tap(probe_gcmd, from_z, lift_speed,
-                                               start_z, scatter=False)
-                if verdict != 'pass':
-                    failed = (verdict, detail)
-                    break
-                faults['run'] = 0
-                if z is None:
-                    continue
-                zs.append(z)
-                from_z = z + lift
-                report(n)
+            if not too_far():
+                for n in range(2, samples + 1):
+                    verdict, detail, z = self._tap(probe_gcmd, from_z,
+                                                   lift_speed, start_z,
+                                                   scatter=False)
+                    if verdict != 'pass':
+                        failed = (verdict, detail)
+                        break
+                    faults['run'] = 0
+                    if z is None:
+                        continue
+                    zs.append(z)
+                    from_z = z + lift
+                    report(n)
+                    if too_far():
+                        break
+            if too_far():
+                self._lift_to(start_z, lift_speed)
+                gcmd.respond_info(
+                    "  speed %5.1f  tap_thresh %6.0f  accuracy %.4f is worse"
+                    " than %.4f after %d tap(s) - raising tap_thresh"
+                    % (speed, thresh, abs(sum(zs) / len(zs)), worst, len(zs)))
+                continue
             if failed is None and len(zs) >= 2:
                 mean = sum(zs) / len(zs)
                 spread = max(zs) - min(zs)
                 sigma = math.sqrt(sum((v - mean) ** 2 for v in zs)
                                   / len(zs))
                 self._lift_to(start_z, lift_speed)
-                if abs(mean) > worst:
-                    # Triggering that far from the bed is not a measurement of
-                    # anything: the tap is latching on something other than the
-                    # contact, or the effector is deflecting that far
-                    # before the chip sees it. Treat it like any other
-                    # unusable threshold.
-                    gcmd.respond_info(
-                        "  speed %5.1f  tap_thresh %6.0f  accuracy %.4f is"
-                        " worse than %.4f - raising tap_thresh"
-                        % (speed, thresh, abs(mean), worst))
-                    continue
                 # The trigger height is signed - it is a toolhead position, and
                 # contact below nominal zero is the normal case. What ranks the
                 # pairs is its distance from zero, so keep both.
