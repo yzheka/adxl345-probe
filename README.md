@@ -364,11 +364,12 @@ This is the direction that spares the bed: a threshold that is too low fails
 before the effector has descended, so the climb costs one contactless probe per
 step. A `deaf` result ends the speed — nothing higher can be more sensitive.
 
-**2. Measure the accuracy.** The first threshold that taps is the one used.
-`SAMPLES` taps run at it, **on the spot the successful tap landed on**, lifting
-`LIFT` mm between them rather than returning to `Z`. Nothing moves in XY during
-the measurement — the point is to measure the probe, and moving between taps
-would fold the shape of the bed into the result.
+**2. Measure the accuracy.** The tap that found the threshold is tap #1 of the
+measurement: it already landed on a spot, so the remaining `SAMPLES` - 1 taps go
+to the same place, lifting `LIFT` mm between them rather than returning to `Z`.
+Nothing moves in XY from there on — the point is to measure the probe, and moving
+between taps would fold the shape of the bed into the result. `SAMPLES` taps in
+total, all of them counted.
 
 The **average trigger height** of those taps is the accuracy for that pair —
 strictly, its distance from nominal Z=0, since the trigger position itself is
@@ -383,9 +384,6 @@ effector is deflecting that far first. That threshold is treated as unusable and
 the walk carries on upward, exactly as it does for a misfire.
 
 The spread and sigma are reported alongside the average.
-
-The tap that found the threshold is not counted: it descended from `Z` rather
-than from `LIFT`, so it is not the same measurement.
 
 If the accuracy run breaks down part way, that threshold only works
 intermittently: the walk carries on upward instead of giving up on the speed.
@@ -507,7 +505,7 @@ is worth taking.
 
 - **This takes a while.** The defaults are eleven speeds, each walking up from
   the 1 g floor one register at a time, so roughly 540 probes for a machine
-  whose threshold lands near 34000 — about 25 minutes. Only 121 of them touch
+  whose threshold lands near 34000 — about 25 minutes. Only 110 of them touch
   the bed. See [Choosing the range](#choosing-the-range) for the two
   settings that cut it down.
 - **Stand over the machine for the first run.** A probe at a threshold that is
@@ -541,10 +539,10 @@ eleven-speed run whose band drifts with speed:
 | | Total probes | Misfires (no contact) | Taps | Drove into the bed |
 | --- | --- | --- | --- | --- |
 | Bisecting down from `THRESHOLD_END` | 385 | 26 | 341 | 18 |
-| `ADXL_PROBE_CALIBRATE` | 613 | 492 | **121** | **0** |
+| `ADXL_PROBE_CALIBRATE` | 913 | 803 | **110** | **0** |
 
-Eleven bed contacts per speed — one to find the threshold and ten to measure it
-— however far the walk had to climb.
+Ten bed contacts per speed, however far the walk had to climb: the tap that
+finds the threshold is the first of the ten that measure it.
 
 **The spot.** The walk's contacts are spread out by `DEVIATION`, which defaults
 to 20 mm, so the climb does not land in one place. The ten measuring taps do all
@@ -579,8 +577,8 @@ ADXL_PROBE_CALIBRATE: results, best first
   2. speed  12.0  tap_thresh  27000  accuracy 0.0218  (average z -0.0218)  range 0.0040  sigma 0.0014  (10 taps)
 ```
 
-`tap #1` reports the height it triggered at, because one tap is not an accuracy
-yet — and it is signed, because it is a toolhead position, and contact below
+`tap #1` is the tap that found the threshold. It reports the height it triggered
+at, because one tap is not an accuracy yet — and it is signed, because it is a toolhead position, and contact below
 nominal zero is normal. From `tap #2` on, each line is the average distance from
 zero over every tap so far at that threshold and speed, so you can watch it
 converge — and see immediately if it does not. The last one is the figure the

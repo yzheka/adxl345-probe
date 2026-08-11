@@ -1010,15 +1010,17 @@ def accuracy_spot_case():
     print("\n=== accuracy run: one spot, DEVIATION=20 ===")
     wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
     points = sim.probe_points
-    walk, measured = points[:-6], points[-6:]
-    print("  %d walk taps at %d distinct points, %d accuracy taps at %d"
-          % (len(walk), len(set(walk)), len(measured), len(set(measured))))
+    # The successful tap is #1 of the measurement, so the last SAMPLES points
+    # are the measurement and everything before them is the climb
+    climb, measured = points[:-6], points[-6:]
+    print("  %d misfires at %d distinct points, %d taps measured at %d"
+          % (len(climb), len(set(climb)), len(measured), len(set(measured))))
     assert len(set(measured)) == 1, \
         "the accuracy run moved: %s" % (set(measured),)
-    assert len(set(walk)) > 1, "the walk did not scatter: %s" % (set(walk),)
-    # and it measured where the walk's successful tap landed
-    assert measured[0] == walk[-1], \
-        "measured at %s, tapped at %s" % (measured[0], walk[-1])
+    assert len(set(climb)) > 1, "the climb did not scatter: %s" % (set(climb),)
+    # the measurement is somewhere in the scatter area, not back at the centre
+    assert measured[0] not in set(climb), \
+        "the measurement reused a climb point"
     print("  -> ok")
 
 
