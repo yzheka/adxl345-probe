@@ -123,6 +123,7 @@ tap_thresh: 12000
 tap_dur: 0.01
 speed: 5
 probe_accel: 1000
+drivers_current: 0.7
 samples: 3
 sample_retract_dist: 3.0
 samples_result: median
@@ -202,6 +203,40 @@ threshold that is far too high.
 | `lift_speed` | value of `speed` | Speed in mm/s for retract moves between samples. |
 | `probe_accel` | unset | Acceleration limit in mm/s² applied to the **probing move only**, restored afterwards. The acceleration transient at the start of the move is the usual cause of false triggers, so this is the main knob for them. Ignored if the current limit is already lower. On a delta the effective Z acceleration is `min(max_accel, max_z_accel)`, so this only bites if it is below both. |
 | `min_probe_travel` | `0.5` | Minimum descent in mm before a trigger is accepted. A trigger inside this distance raises a clear error instead of returning a bogus Z. Must be **smaller than `sample_retract_dist`**, or every sample after the first is rejected. Set to `0` to disable. |
+| `drivers_current` | unset | Fraction of their present run current that the steppers holding Z are dropped to for the **probing move only**, restored afterwards. `0.5` halves it. A softer hold means the effector gives way sooner instead of the bed taking the force, and the move is quieter. See [Lowering the stepper current](#lowering-the-stepper-current). |
+
+### Lowering the stepper current
+
+`drivers_current` is a fraction rather than an amperage, so it needs no
+knowledge of your motors or board: whatever the driver is set to when the probe
+starts, it is multiplied by that fraction and put back afterwards.
+
+Which steppers it touches follows the kinematics — specifically, every stepper
+the kinematics drive on Z, which is the same test Klipper uses to decide which
+steppers a probe endstop has to hold:
+
+| Kinematics | Steppers lowered |
+| --- | --- |
+| delta | `stepper_a`, `stepper_b`, `stepper_c` — moving Z moves all three towers |
+| cartesian, corexy | `stepper_z`, plus `stepper_z1`/`z2`/`z3` if you have them |
+
+It is applied through `SET_TMC_CURRENT`, so it needs a TMC driver section for
+those steppers (`[tmc2209 stepper_a]` and so on). With no TMC driver to set it
+on, the setting is ignored and the run goes ahead at whatever current the
+steppers are already at — it logs that it did nothing, but does not fail.
+
+**Do not go too low.** The tower steppers are holding the effector's weight. If
+the current is not enough to hold position against the contact, they skip
+instead, and then the trigger height is measuring lost steps rather than the
+bed — and Z is silently wrong for everything that follows. Start at `0.7`, watch
+the accuracy figures, and treat a sudden improvement with suspicion: a probe
+that suddenly reads much closer to zero may be a stepper giving way, not a
+gentler tap. Anything that skips is also likely to fail
+[the 0.1 mm accuracy ceiling](#what-it-does), which is a useful backstop but not
+a guarantee.
+
+The current is restored when the probing move ends and again when the probe
+session ends, so an aborted or failed probe cannot leave the steppers weak.
 
 ### Offsets
 

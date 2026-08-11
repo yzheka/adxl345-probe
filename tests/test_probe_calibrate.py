@@ -44,6 +44,9 @@ class Toolhead:
         self.homed_axes = 'xyz'
         self.moves = []
 
+    def get_kinematics(self):
+        return Kinematics(self.sim.steppers)
+
     def get_position(self):
         return list(self.pos)
 
@@ -147,6 +150,14 @@ class GCode:
         return GCmd(dict(params), [], quiet=True)
 
     def run_script_from_command(self, script):
+        if script.startswith('SET_TMC_CURRENT'):
+            parts = dict(p.split('=') for p in script.split()[1:])
+            name = 'tmc2209 %s' % (parts['STEPPER'],)
+            driver = self.sim.drivers.get(name)
+            if driver is None:
+                raise CommandError("Unknown TMC driver %s" % (name,))
+            driver.set_current(float(parts['CURRENT']))
+            return
         if script == 'SAVE_CONFIG':
             self.sim.configfile.save_config_calls += 1
         elif script == 'G28':
@@ -231,6 +242,53 @@ class ControllerFan(PrinterFan):
         self.idle_speed = 0.6
 
 
+class Stepper:
+    """Stand-in for stepper.MCU_stepper. is_active_axis('z') is how Klipper
+    itself decides which steppers a probe endstop has to hold: on a delta all
+    three towers answer yes, on a cartesian only stepper_z does."""
+
+    def __init__(self, name, axes='z'):
+        self.name = name
+        self.axes = axes
+
+    def get_name(self):
+        return self.name
+
+    def is_active_axis(self, axis):
+        return axis in self.axes
+
+
+class Kinematics:
+    def __init__(self, steppers):
+        self.steppers = steppers
+
+    def get_steppers(self):
+        return self.steppers
+
+
+class TMCDriver:
+    """Stand-in for a [tmc2209 stepper_x] section: get_status reports the live
+    run_current, and SET_TMC_CURRENT is what changes it."""
+
+    def __init__(self, run_current=0.8):
+        self.run_current = run_current
+        self.history = []
+
+    def get_status(self, eventtime):
+        return {'run_current': self.run_current, 'hold_current': 0.5,
+                'drv_status': None}
+
+    def set_current(self, value):
+        self.run_current = value
+        self.history.append(round(value, 4))
+
+
+DELTA_STEPPERS = [Stepper('stepper_a'), Stepper('stepper_b'),
+                  Stepper('stepper_c')]
+CARTESIAN_STEPPERS = [Stepper('stepper_x', 'x'), Stepper('stepper_y', 'y'),
+                      Stepper('stepper_z'), Stepper('stepper_z1')]
+
+
 class Printer:
     def __init__(self, sim):
         self.sim = sim
@@ -238,7 +296,7 @@ class Printer:
         self.config_error = ConfigError
 
     def lookup_objects(self, module=None):
-        return list(self.sim.fans.items())
+        return list(self.sim.fans.items()) + list(self.sim.drivers.items())
 
     def lookup_object(self, name, default='\x00'):
         objs = {'toolhead': self.sim.toolhead, 'adxl345': self.sim.chip,
@@ -361,6 +419,9 @@ class Sim:
         # print_stats / virtual_sdcard are optional in a Klipper config
         self.printer_objects = {}
         self.fans = {}
+        # Delta by default: three towers, all of them active on Z
+        self.steppers = list(DELTA_STEPPERS)
+        self.drivers = {}
         self.chip = Chip()
         self.toolhead = Toolhead(self)
         self.configfile = ConfigFile()
@@ -700,6 +761,117 @@ def fan_pending_case():
 
 
 fan_pending_case()
+
+
+# --- drivers_current --------------------------------------------------------
+
+def current_case(name, steppers, drivers, fraction, want_lowered,
+                 want_untouched=()):
+    """The steppers that hold Z drop to a fraction of their current for each
+    probing move and go back afterwards. On a delta that is all three towers,
+    since moving Z moves all of them; elsewhere it is the Z steppers only."""
+    import extras.adxl345_probe as mod
+    sim = Sim(30, 200)
+    sim.steppers = steppers
+    sim.drivers = {'tmc2209 %s' % n: TMCDriver(a) for n, a in drivers.items()}
+    before = {n: d.run_current for n, d in sim.drivers.items()}
+    wrapper = build(sim, mod, {'drivers_current': fraction})
+    log = []
+    gcmd = GCmd({'SPEED_START': 5, 'SPEED_END': 5, 'SPEED_STEP': 1,
+                 'SAMPLES': 4, 'DEVIATION': 0}, log, quiet=True)
+    print("\n=== drivers_current: %s ===" % name)
+    wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
+    for n in want_lowered:
+        driver = sim.drivers['tmc2209 %s' % n]
+        want = round(before['tmc2209 %s' % n] * fraction, 3)
+        assert want in driver.history, \
+            "%s never went to %.3f (saw %s)" % (n, want, driver.history)
+        # every drop is followed by the value it came from
+        assert driver.history[-1] == before['tmc2209 %s' % n], \
+            "%s left at %.3f, not %.3f" \
+            % (n, driver.history[-1], before['tmc2209 %s' % n])
+        assert driver.run_current == before['tmc2209 %s' % n], \
+            "%s not restored" % n
+        pairs = len([v for v in driver.history if v == want])
+        print("  %s: %.3f -> %.3f and back, %d times"
+              % (n, before['tmc2209 %s' % n], want, pairs))
+    for n in want_untouched:
+        driver = sim.drivers['tmc2209 %s' % n]
+        assert not driver.history, "%s was touched: %s" % (n, driver.history)
+        print("  %s: untouched" % n)
+    print("  -> ok")
+
+
+current_case("delta lowers all three towers", list(DELTA_STEPPERS),
+             {'stepper_a': 0.9, 'stepper_b': 0.9, 'stepper_c': 0.9}, 0.4,
+             ('stepper_a', 'stepper_b', 'stepper_c'))
+current_case("cartesian lowers only Z", list(CARTESIAN_STEPPERS),
+             {'stepper_x': 1.2, 'stepper_y': 1.2, 'stepper_z': 0.8,
+              'stepper_z1': 0.8}, 0.5,
+             ('stepper_z', 'stepper_z1'), ('stepper_x', 'stepper_y'))
+
+
+def current_absent_case():
+    """drivers_current with no TMC driver to set it on is not an error - the
+    run goes ahead at whatever current the steppers are already at."""
+    import extras.adxl345_probe as mod
+    sim = Sim(30, 200)
+    sim.drivers = {}
+    wrapper = build(sim, mod, {'drivers_current': 0.4})
+    gcmd = GCmd({'SPEED_START': 5, 'SPEED_END': 5, 'SPEED_STEP': 1,
+                 'SAMPLES': 4, 'DEVIATION': 0}, [], quiet=True)
+    print("\n=== drivers_current: no TMC driver present ===")
+    wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
+    assert sim.configfile.saved.get(('adxl345_probe', 'tap_thresh')), \
+        "the run did not finish"
+    print("  -> ran anyway, ok")
+
+
+current_absent_case()
+
+
+def current_unset_case():
+    """Without drivers_current nothing is touched at all."""
+    import extras.adxl345_probe as mod
+    sim = Sim(30, 200)
+    sim.drivers = {'tmc2209 stepper_a': TMCDriver(0.9)}
+    wrapper = build(sim, mod)
+    gcmd = GCmd({'SPEED_START': 5, 'SPEED_END': 5, 'SPEED_STEP': 1,
+                 'SAMPLES': 4, 'DEVIATION': 0}, [], quiet=True)
+    print("\n=== drivers_current: unset ===")
+    wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
+    driver = sim.drivers['tmc2209 stepper_a']
+    assert not driver.history, "the current was changed: %s" % driver.history
+    print("  -> left alone, ok")
+
+
+current_unset_case()
+
+
+def current_restore_on_abort_case():
+    """A probe that fails still puts the current back - a stepper left on a
+    fraction of its current would lose position on the next print move."""
+    import extras.adxl345_probe as mod
+    sim = Sim(30, 200)
+    sim.drivers = {'tmc2209 stepper_a': TMCDriver(0.9)}
+    sim.fault = "Failed to set ADXL345 register [0x1d] to 0x20: got 0x0."
+    sim.fault_after = 1
+    wrapper = build(sim, mod, {'drivers_current': 0.4})
+    gcmd = GCmd({'SPEED_START': 5, 'SPEED_END': 5, 'SPEED_STEP': 1,
+                 'SAMPLES': 4, 'DEVIATION': 0}, [], quiet=True)
+    print("\n=== drivers_current: restored after an aborted run ===")
+    try:
+        wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
+    except CommandError as e:
+        print("  ERROR: %s" % str(e)[:70])
+    driver = sim.drivers['tmc2209 stepper_a']
+    assert driver.history, "the current was never lowered"
+    assert driver.run_current == 0.9, \
+        "left at %.3f, not 0.9" % driver.run_current
+    print("  -> back to %.3f, ok" % driver.run_current)
+
+
+current_restore_on_abort_case()
 
 
 # --- session teardown -------------------------------------------------------

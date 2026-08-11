@@ -17,6 +17,9 @@
 #                       touch the bed: a threshold too low to work misfires
 #                       before the effector has descended, and the taps are
 #                       scattered over an area so a run does not dent one spot
+#   drivers_current   - fraction of their run current the steppers holding Z
+#                       drop to for the probing move, restored afterwards: a
+#                       softer hold, so the effector gives way before the bed
 #   disable_fans      - works with every fan section type, not only the ones
 #                       that happen to expose a fan_speed attribute
 #
@@ -136,6 +139,12 @@ class ADXL345EndstopWrapper:
         # knob for false triggers.
         self.probe_accel = config.getfloat('probe_accel', None, above=0.)
         self.saved_accel = None
+        # Fraction of their configured current the steppers that hold Z are
+        # dropped to for the probing move, restored afterwards. Resolved to
+        # [{stepper, obj, saved}] on first use, once every object exists.
+        self.drivers_current = config.getfloat('drivers_current', None,
+                                               above=0., maxval=1.)
+        self.driver_objects = None
         # Settle time before arming and after disarming tap detection. Too
         # short and residual ringing from the retract move trips the tap.
         self.rest_time = config.getfloat('rest_time', ADXL345_REST_TIME,
@@ -362,6 +371,90 @@ class ADXL345EndstopWrapper:
         self.saved_accel = None
         self._apply_accel(accel)
 
+    # --- Stepper current -------------------------------------------------
+    # Holding Z with less current for the probing move makes the contact
+    # softer - the effector gives way sooner instead of the bed taking it -
+    # and quieter. drivers_current is a fraction of whatever the driver is set
+    # to at the time, so it needs no knowledge of the motor or the board.
+    #
+    # The steppers to lower are the ones the kinematics drive on Z: all three
+    # towers on a delta, since moving Z moves all of them, and stepper_z plus
+    # any z1/z2/z3 elsewhere. That is the same test Klipper uses to decide
+    # which steppers a probe endstop has to hold.
+    def _resolve_drivers(self):
+        if self.driver_objects is not None:
+            return self.driver_objects
+        self.driver_objects = []
+        if self.drivers_current is None:
+            return self.driver_objects
+        try:
+            kin = self.printer.lookup_object('toolhead').get_kinematics()
+            steppers = kin.get_steppers()
+        except Exception:
+            logging.exception("adxl345_probe: cannot list the steppers")
+            return self.driver_objects
+        wanted = []
+        for stepper in steppers:
+            try:
+                if stepper.is_active_axis('z'):
+                    wanted.append(stepper.get_name())
+            except Exception:
+                continue
+        for name, obj in self.printer.lookup_objects():
+            parts = name.split()
+            if (len(parts) == 2 and parts[0].startswith('tmc')
+                    and parts[1] in wanted and hasattr(obj, 'get_status')):
+                self.driver_objects.append({'stepper': parts[1], 'obj': obj,
+                                           'saved': None})
+        if not self.driver_objects:
+            logging.info("adxl345_probe: drivers_current is set, but none of"
+                         " %s has a TMC driver to set it on",
+                         ", ".join(wanted) or "the Z steppers")
+        return self.driver_objects
+
+    # SET_TMC_CURRENT rather than the driver's own API: the current helper's
+    # signature has changed between Klipper versions, the command has not, and
+    # it applies the change at the right print time by itself.
+    def _apply_current(self, stepper, value):
+        self.printer.lookup_object('gcode').run_script_from_command(
+            "SET_TMC_CURRENT STEPPER=%s CURRENT=%.3f" % (stepper, value))
+
+    def _set_probe_current(self):
+        eventtime = self.printer.get_reactor().monotonic()
+        for entry in self._resolve_drivers():
+            if entry['saved'] is not None:
+                continue
+            try:
+                run = entry['obj'].get_status(eventtime).get('run_current')
+            except Exception:
+                logging.exception("adxl345_probe: cannot read the %s current",
+                                  entry['stepper'])
+                continue
+            if not run:
+                continue
+            entry['saved'] = run
+            try:
+                self._apply_current(entry['stepper'],
+                                    run * self.drivers_current)
+            except Exception:
+                # Put it back rather than leaving it half applied
+                entry['saved'] = None
+                raise
+
+    # Best effort, and never raises: leaving a stepper on a fraction of its
+    # current is worse than whatever went wrong here, and this runs from the
+    # teardown of a probe that may already be failing.
+    def _restore_current(self):
+        for entry in self.driver_objects or []:
+            saved, entry['saved'] = entry['saved'], None
+            if saved is None:
+                continue
+            try:
+                self._apply_current(entry['stepper'], saved)
+            except Exception:
+                logging.exception("adxl345_probe: cannot restore the %s"
+                                  " current to %.3f", entry['stepper'], saved)
+
     def _arm_tap(self):
         chip = self.adxl345
         toolhead = self.printer.lookup_object('toolhead')
@@ -431,6 +524,7 @@ class ADXL345EndstopWrapper:
         toolhead = self.printer.lookup_object('toolhead')
         start_z = toolhead.get_position()[2]
         self._set_probe_accel()
+        self._set_probe_current()
         try:
             # activate_gcode lives out here so that every path which has run
             # it also runs deactivate_gcode. _arm_tap can raise (tap latched
@@ -447,6 +541,7 @@ class ADXL345EndstopWrapper:
             self._disarm_tap()
         finally:
             self._restore_accel()
+            self._restore_current()
         if travel < self.min_probe_travel:
             raise self.printer.command_error(
                 "ADXL345 probe triggered after only %.3fmm of travel"
@@ -461,6 +556,7 @@ class ADXL345EndstopWrapper:
     def end_probe_session(self):
         self.homing_helper.clear_trigger_positions()
         self._restore_accel()
+        self._restore_current()
         in_session, self.in_session = self.in_session, False
         # Unconditional, and a no-op if nothing is switched off: the fans go
         # off before the session is marked open, so a failure in between must
