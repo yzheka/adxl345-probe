@@ -525,6 +525,33 @@ def defaults_case():
     print("  -> ok")
 
 
+def floor_case():
+    """The default THRESHOLD_START is below the 1g floor too, so the walk still
+    starts at the floor - but silently, since the user did not ask for it."""
+    import extras.adxl345_probe as mod
+    for params, want_note in (({}, False), ({'THRESHOLD_START': 1000}, True)):
+        sim = Sim(30, 200)
+        wrapper = build(sim, mod)
+        log = []
+        args = {'SPEED_START': 5, 'SPEED_END': 5, 'DEVIATION': 0}
+        args.update(params)
+        gcmd = GCmd(args, log, quiet=True)
+        wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
+        note = [ln for ln in log if 'is the lowest that can work' in ln]
+        first = sim.tested[0][1]
+        print("\n=== 1g floor: THRESHOLD_START=%s ==="
+              % (params.get('THRESHOLD_START', 'default'),))
+        print("  first register probed: %d, explained: %s"
+              % (first, bool(note)))
+        assert first == mod.TAP_FLOOR_CODE, "started at reg %d" % first
+        assert bool(note) == want_note, \
+            "note %s" % ("missing" if want_note else "unexpected")
+    print("  -> ok")
+
+
+floor_case()
+
+
 def dedupe_case():
     """A step finer than one register (612.9 mm/s^2) would re-probe the same
     chip setting, so those thresholds are dropped."""

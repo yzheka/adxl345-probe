@@ -56,9 +56,10 @@ TAP_GRAVITY_CODE = int(adxl345.FREEFALL_ACCEL / TAP_SCALE)
 TAP_FLOOR_CODE = TAP_GRAVITY_CODE + 1
 
 # ADXL_PROBE_CALIBRATE defaults
-# The lowest threshold that can latch a tap at all - one register above 1g.
-# Anything lower is not "very sensitive", it is deaf.
-CAL_THRESHOLD_START = math.ceil(TAP_FLOOR_CODE * TAP_SCALE)
+# 10000 truncates to register 16, which is exactly 1g and therefore still deaf,
+# so the walk actually starts one register up (see TAP_FLOOR_CODE). Kept as the
+# round number because that is what it means to ask for: "start at the bottom".
+CAL_THRESHOLD_START = 10000.
 CAL_THRESHOLD_END = 100000.
 CAL_THRESHOLD_STEP = 1000.  # mm/s**2 added after a misfire
 CAL_SPEED_START = 10.
@@ -584,13 +585,18 @@ class ADXL345EndstopWrapper:
             raise gcmd.error("THRESHOLD_END must not be below THRESHOLD_START")
         floor = self._code_thresh(TAP_FLOOR_CODE)
         if lo < floor:
-            gcmd.respond_info(
-                "ADXL_PROBE_CALIBRATE: starting at %.0f mm/s^2, not %.0f -"
-                " THRESH_TAP includes the 1g the effector already carries, so"
-                " anything at or below %.0f is permanently exceeded and no tap"
-                " is ever latched. Register %d is the lowest that can work."
-                % (floor, lo, self._code_thresh(TAP_GRAVITY_CODE),
-                   TAP_FLOOR_CODE))
+            # Only worth explaining when it was asked for. The default is below
+            # the floor as well, and the summary line reports the real range
+            # either way.
+            if gcmd.get('THRESHOLD_START', None) is not None:
+                gcmd.respond_info(
+                    "ADXL_PROBE_CALIBRATE: starting at %.0f mm/s^2, not %.0f -"
+                    " THRESH_TAP includes the 1g the effector already carries,"
+                    " so anything at or below %.0f is permanently exceeded and"
+                    " no tap is ever latched. Register %d is the lowest that"
+                    " can work."
+                    % (floor, lo, self._code_thresh(TAP_GRAVITY_CODE),
+                       TAP_FLOOR_CODE))
             lo = floor
         if hi < floor:
             raise gcmd.error(

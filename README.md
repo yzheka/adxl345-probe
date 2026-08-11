@@ -178,8 +178,10 @@ fall-back never happens, and no tap is ever registered:
 | 10420 | 17 | 1.06 g | lowest setting that can work |
 | 12000 | 19 | 1.19 g | fine |
 
-1 g lands exactly on register 16, so **17 is the lowest usable register**. Note
-the module's own `tap_thresh` default of `5000` is inside the dead zone — it is
+1 g lands exactly on register 16, so **17 is the lowest usable register**, and
+`ADXL_PROBE_CALIBRATE` never probes below it — its `THRESHOLD_START` default of
+10000 is itself in the dead zone, so the walk quietly begins at 10420. Note the
+module's own `tap_thresh` default of `5000` is inside the dead zone too — it is
 inherited from upstream and has to be raised.
 
 The symptom is the giveaway: a threshold that is too *low* reads as
@@ -392,7 +394,7 @@ and stages nothing.
 
 | Parameter | Default | Description |
 | --------- | ------- | ----------- |
-| `THRESHOLD_START` | `10420` | First `tap_thresh` tried at every speed, in mm/s². This is the lowest value that can detect a tap at all (register 17, just above 1 g); a lower request is raised to it with a note saying why — see [The 1 g floor](#the-1-g-floor). |
+| `THRESHOLD_START` | `10000` | First `tap_thresh` tried at every speed, in mm/s². 10000 truncates to register 16, which is exactly 1 g and therefore still deaf, so the walk actually begins one register up at 10420 — see [The 1 g floor](#the-1-g-floor). A value you pass explicitly that is below the floor is raised to it with a note saying why. |
 | `THRESHOLD_END` | `100000` | Highest `tap_thresh` the walk will reach before giving up on a speed. |
 | `THRESHOLD_STEP` | `1000` | How much `tap_thresh` rises after a misfire, in mm/s². The chip stores the threshold at **612.9 mm/s² per register step**, so values that land on a register already tried are skipped rather than re-probed. |
 | `SPEED_START` | `10` | First probing speed in mm/s. |
