@@ -584,20 +584,6 @@ class ADXL345EndstopWrapper:
         if hi < lo:
             raise gcmd.error("THRESHOLD_END must not be below THRESHOLD_START")
         floor = self._code_thresh(TAP_FLOOR_CODE)
-        if lo < floor:
-            # Only worth explaining when it was asked for. The default is below
-            # the floor as well, and the summary line reports the real range
-            # either way.
-            if gcmd.get('THRESHOLD_START', None) is not None:
-                gcmd.respond_info(
-                    "ADXL_PROBE_CALIBRATE: starting at %.0f mm/s^2, not %.0f -"
-                    " THRESH_TAP includes the 1g the effector already carries,"
-                    " so anything at or below %.0f is permanently exceeded and"
-                    " no tap is ever latched. Register %d is the lowest that"
-                    " can work."
-                    % (floor, lo, self._code_thresh(TAP_GRAVITY_CODE),
-                       TAP_FLOOR_CODE))
-            lo = floor
         if hi < floor:
             raise gcmd.error(
                 "ADXL_PROBE_CALIBRATE: THRESHOLD_END=%.0f is at or below the"
@@ -637,9 +623,22 @@ class ADXL345EndstopWrapper:
     # keeps the bed intact. Returns the accuracy measurement for this speed.
     def _measure_speed(self, gcmd, probe_gcmd, speed, thresholds, samples,
                        lift, start_z, lift_speed):
+        probed = []
         for thresh in thresholds:
+            if self._tap_code(thresh) <= TAP_GRAVITY_CODE:
+                # Below 1g nothing can latch, and it is arithmetic rather than
+                # anything the machine has to demonstrate. Probing it would
+                # cost a full-depth descent with the nozzle loaded against the
+                # bed for the whole of it, to learn what the register value
+                # already says.
+                gcmd.respond_info(
+                    "  speed %5.1f  tap_thresh %6.0f (reg %3d): %-9s at or"
+                    " below 1g, no tap can latch there - not probed"
+                    % (speed, thresh, self._tap_code(thresh), 'skipped'))
+                continue
             self.tap_thresh = thresh
             self._write_tap_regs()
+            probed.append(thresh)
             verdict, detail, z = self._tap(probe_gcmd, start_z, lift_speed,
                                            start_z)
             gcmd.respond_info(
@@ -647,9 +646,9 @@ class ADXL345EndstopWrapper:
                 % (speed, thresh, self._tap_code(thresh), verdict, detail))
             if verdict == 'deaf':
                 # Nothing higher can be more sensitive than this was. If even
-                # the first threshold missed, the fault is upstream of
+                # the first one probed missed, the fault is upstream of
                 # tap_thresh - say so rather than blaming the range.
-                if thresh == thresholds[0]:
+                if len(probed) == 1:
                     raise self.NoThreshold(
                         "the most sensitive usable tap_thresh (%.0f) did not"
                         " feel the bed at all. That is not a threshold"
@@ -702,7 +701,7 @@ class ADXL345EndstopWrapper:
                    failed[1] if failed else "no trigger position reported"))
         raise self.NoThreshold(
             "every tap_thresh from %.0f to %.0f mm/s^2 misfired"
-            % (thresholds[0], thresholds[-1]))
+            % (probed[0], probed[-1]))
 
     def cmd_ADXL_PROBE_CALIBRATE(self, gcmd):
         # Refuse before parsing anything, and refuse by returning rather than
@@ -743,12 +742,18 @@ class ADXL345EndstopWrapper:
         keep = False
         measured = []
 
+        dead = sum(1 for t in thresholds
+                   if self._tap_code(t) <= TAP_GRAVITY_CODE)
         gcmd.respond_info(
             "ADXL_PROBE_CALIBRATE: speeds %s mm/s, tap_thresh %.0f - %.0f"
-            " mm/s^2 in %d step(s), %d taps per measurement. Every speed"
+            " mm/s^2 in %d step(s)%s, %d taps per measurement. Every speed"
             " starts over at %.0f mm/s^2."
             % (", ".join("%g" % s for s in speeds), thresholds[0],
-               thresholds[-1], len(thresholds), samples, thresholds[0]))
+               thresholds[-1], len(thresholds),
+               "" if not dead else
+               " of which the first %d are at or below 1g and are reported"
+               " without being probed" % (dead,),
+               samples, thresholds[0]))
 
         self.start_probe_session(gcmd)
         self.managed_session = True

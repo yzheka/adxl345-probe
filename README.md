@@ -178,11 +178,20 @@ fall-back never happens, and no tap is ever registered:
 | 10420 | 17 | 1.06 g | lowest setting that can work |
 | 12000 | 19 | 1.19 g | fine |
 
-1 g lands exactly on register 16, so **17 is the lowest usable register**, and
-`ADXL_PROBE_CALIBRATE` never probes below it — its `THRESHOLD_START` default of
-10000 is itself in the dead zone, so the walk quietly begins at 10420. Note the
-module's own `tap_thresh` default of `5000` is inside the dead zone too — it is
+1 g lands exactly on register 16, so **17 is the lowest usable register**. Note
+the module's own `tap_thresh` default of `5000` is inside the dead zone — it is
 inherited from upstream and has to be raised.
+
+`ADXL_PROBE_CALIBRATE` starts its walk wherever `THRESHOLD_START` says, dead
+zone included, but it does not *probe* the dead rungs. Whether a register can
+latch is arithmetic, and a probe that cannot latch runs its move to the descent
+floor with the nozzle loaded against the bed for the whole of it. So those rungs
+are reported and stepped over:
+
+```
+  speed  10.0  tap_thresh  10000 (reg  16): skipped   at or below 1g, no tap can latch there - not probed
+  speed  10.0  tap_thresh  11000 (reg  17): sensitive Probe triggered prior to movement
+```
 
 The symptom is the giveaway: a threshold that is too *low* reads as
 `triggered after only 0.000mm of travel` (a misfire) only while it is above the
@@ -343,9 +352,9 @@ It refuses to start while a print is running or paused — see
 
 For each speed from `SPEED_START` to `SPEED_END`:
 
-**1. Walk `tap_thresh` up.** Starting at `THRESHOLD_START` — which is the
-lowest threshold that can detect a tap at all, see
-[The 1 g floor](#the-1-g-floor) — tap once. Each attempt ends one of three
+**1. Walk `tap_thresh` up.** Starting at `THRESHOLD_START`, tap once. Rungs at
+or below 1 g are logged and stepped over rather than probed — see
+[The 1 g floor](#the-1-g-floor). Each attempt that does run ends one of three
 ways:
 
 | Result | Meaning | What the nozzle does |
@@ -394,7 +403,7 @@ and stages nothing.
 
 | Parameter | Default | Description |
 | --------- | ------- | ----------- |
-| `THRESHOLD_START` | `10000` | First `tap_thresh` tried at every speed, in mm/s². 10000 truncates to register 16, which is exactly 1 g and therefore still deaf, so the walk actually begins one register up at 10420 — see [The 1 g floor](#the-1-g-floor). A value you pass explicitly that is below the floor is raised to it with a note saying why. |
+| `THRESHOLD_START` | `10000` | First `tap_thresh` tried at every speed, in mm/s². The walk starts exactly here, wherever you put it. Rungs at or below 1 g are listed in the log and stepped over without being probed, since nothing can latch there and a probe would only drive the nozzle into the bed to prove it — see [The 1 g floor](#the-1-g-floor). |
 | `THRESHOLD_END` | `100000` | Highest `tap_thresh` the walk will reach before giving up on a speed. |
 | `THRESHOLD_STEP` | `1000` | How much `tap_thresh` rises after a misfire, in mm/s². The chip stores the threshold at **612.9 mm/s² per register step**, so values that land on a register already tried are skipped rather than re-probed. |
 | `SPEED_START` | `10` | First probing speed in mm/s. |

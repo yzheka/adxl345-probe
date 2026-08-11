@@ -400,18 +400,20 @@ SINGLE_SPEED = {'SPEED_START': 5, 'SPEED_END': 5, 'SPEED_STEP': 1,
                 'SAMPLES': 4, 'DEVIATION': 0}
 
 
-def walk_lands_on(wrapper, sensitive, deaf, lo=None, hi=100000., step=1000.):
-    """The threshold the walk has to stop at: the first one it tries whose
-    register is at or above the misfire edge. None if that one already misses
-    the bed, which is the whole band gone. The walk never starts below the 1g
-    floor, whatever it is asked for."""
+def walk_lands_on(wrapper, sensitive, deaf, lo=10000., hi=100000., step=1000.):
+    """The threshold the walk has to stop at: the first rung it actually probes
+    whose register is at or above the misfire edge. None if that one already
+    misses the bed, which is the whole band gone. Rungs at or below 1g are
+    reported and skipped rather than probed, and a rung landing on a register
+    already tried is dropped."""
     import extras.adxl345_probe as mod
-    floor = wrapper._code_thresh(mod.TAP_FLOOR_CODE)
-    thresh = floor if lo is None or lo < floor else lo
+    thresh, seen = lo, set()
     while thresh <= hi + 1e-9:
         code = wrapper._tap_code(thresh)
-        if code >= sensitive:
-            return None if code > deaf else thresh
+        if code > mod.TAP_GRAVITY_CODE and code not in seen:
+            seen.add(code)
+            if code >= sensitive:
+                return None if code > deaf else thresh
         thresh += step
     return None
 
@@ -445,7 +447,7 @@ def run(name, sensitive_edge, deaf_edge, params, expect_error=None):
     assert expect_error is None, "expected error %r, got success" % expect_error
     want = walk_lands_on(
         wrapper, sensitive_edge, deaf_edge,
-        args.get('THRESHOLD_START') and float(args['THRESHOLD_START']),
+        float(args.get('THRESHOLD_START', 10000.)),
         float(args.get('THRESHOLD_END', 100000.)),
         float(args.get('THRESHOLD_STEP', 1000.)))
     assert want is not None, "the case itself expects no usable threshold"
@@ -481,9 +483,9 @@ run("misfire edge near the end", 160, 200, {})
 # A one-register band is only found if the ladder happens to land on it: a
 # 1000 mm/s^2 step advances the register by one or two, so it can step over one
 run("narrow band the ladder lands on", 61, 61, {})
-run("narrow band the ladder steps over", 60, 60, {},
+run("narrow band the ladder steps over", 62, 62, {},
     expect_error="no speed produced a usable tap_thresh")
-run("...and a 613 step finds it", 60, 60, {'THRESHOLD_STEP': 613})
+run("...and a 613 step finds it", 62, 62, {'THRESHOLD_STEP': 613})
 # Below 1g the chip can never latch a tap, so the walk starts above it however
 # low it is asked to start
 run("a start below 1g is raised to the floor", 90, 200,
@@ -514,10 +516,7 @@ def defaults_case():
              len(thresholds)))
     assert (speeds[0], speeds[-1], len(speeds)) == (10., 30., 11), \
         "speeds %s" % (speeds,)
-    assert wrapper._tap_code(thresholds[0]) == mod.TAP_FLOOR_CODE, \
-        "starts at %g, register %d - the 1g floor is register %d" \
-        % (thresholds[0], wrapper._tap_code(thresholds[0]),
-           mod.TAP_FLOOR_CODE)
+    assert thresholds[0] == 10000., "starts at %g" % thresholds[0]
     assert thresholds[-1] <= 100000., "ends at %g" % thresholds[-1]
     assert thresholds[1] - thresholds[0] == 1000., "step is not 1000"
     assert mod.TAP_GRAVITY_CODE == 16, \
@@ -526,26 +525,31 @@ def defaults_case():
 
 
 def floor_case():
-    """The default THRESHOLD_START is below the 1g floor too, so the walk still
-    starts at the floor - but silently, since the user did not ask for it."""
+    """The walk starts wherever THRESHOLD_START says, including below 1g. Those
+    rungs are reported and stepped over, never probed: a probe there would
+    drive the nozzle to the descent floor to demonstrate what the register
+    value already proves."""
     import extras.adxl345_probe as mod
-    for params, want_note in (({}, False), ({'THRESHOLD_START': 1000}, True)):
+    for start, want_skips in ((None, 1), (1000, 10)):
         sim = Sim(30, 200)
         wrapper = build(sim, mod)
         log = []
         args = {'SPEED_START': 5, 'SPEED_END': 5, 'DEVIATION': 0}
-        args.update(params)
+        if start is not None:
+            args['THRESHOLD_START'] = start
         gcmd = GCmd(args, log, quiet=True)
         wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
-        note = [ln for ln in log if 'is the lowest that can work' in ln]
-        first = sim.tested[0][1]
+        skipped = [ln for ln in log if 'not probed' in ln]
+        dead = [c for _sp, c in sim.tested if c <= mod.TAP_GRAVITY_CODE]
         print("\n=== 1g floor: THRESHOLD_START=%s ==="
-              % (params.get('THRESHOLD_START', 'default'),))
-        print("  first register probed: %d, explained: %s"
-              % (first, bool(note)))
-        assert first == mod.TAP_FLOOR_CODE, "started at reg %d" % first
-        assert bool(note) == want_note, \
-            "note %s" % ("missing" if want_note else "unexpected")
+              % (start if start is not None else 'default',))
+        print("  %d rungs reported without probing, first probed reg %d"
+              % (len(skipped), sim.tested[0][1]))
+        assert not dead, "probed registers %s, at or below 1g" % (dead,)
+        assert len(skipped) == want_skips, \
+            "%d rungs skipped, expected %d" % (len(skipped), want_skips)
+        assert sim.tested[0][1] == mod.TAP_FLOOR_CODE, \
+            "first probe was reg %d" % sim.tested[0][1]
     print("  -> ok")
 
 
@@ -820,7 +824,7 @@ classification_case("genuine misfire", "ADXL345 probe triggered after only"
 
 # --- multi-speed measurement ------------------------------------------------
 
-def speed_case(name, bands, noise, want_speed, want_reg, params=None,
+def speed_case(name, bands, noise, want_speed, params=None,
                expect_error=None):
     """Drive the full speed sweep against a printer whose working band and
     trigger repeatability both move with probing speed."""
@@ -849,6 +853,9 @@ def speed_case(name, bands, noise, want_speed, want_reg, params=None,
     got_reg = sim.chip.regs[0x1D]
     assert got_speed == want_speed, \
         "picked speed %s, expected %s" % (got_speed, want_speed)
+    # The register kept is the first rung of the ladder at or above the winning
+    # speed's misfire edge - derived, so the ladder can change under it
+    want_reg = wrapper._tap_code(walk_lands_on(wrapper, *bands[want_speed]))
     assert got_reg == want_reg, "picked reg %d, expected %d" % (got_reg,
                                                                 want_reg)
     assert wrapper.param_helper.speed == want_speed, "live speed not applied"
@@ -861,11 +868,11 @@ def speed_case(name, bands, noise, want_speed, want_reg, params=None,
 
 # The band drifts upward with speed - a faster tap hits harder, so it takes a
 # higher threshold to stop misfiring. 4 mm/s is the most repeatable. The
-# registers come from the 1000 mm/s^2 ladder, so they are the first rung at or
-# above each misfire edge.
+# register kept for each speed is the first rung of the ladder at or above its
+# misfire edge, which the case derives rather than hard-coding.
 DRIFT = {2.0: (20, 40), 4.0: (26, 50), 6.0: (34, 62), 8.0: (44, 78)}
 speed_case("accuracy picks the winner", DRIFT,
-           {2.0: 0.020, 4.0: 0.004, 6.0: 0.012, 8.0: 0.030}, 4.0, 26)
+           {2.0: 0.020, 4.0: 0.004, 6.0: 0.012, 8.0: 0.030}, 4.0)
 
 # Two speeds tie on spread - both scatter over 0.010. The lower sigma breaks
 # it: 6 mm/s clusters around the middle, 4 mm/s sits at the two extremes. Both
@@ -875,17 +882,17 @@ speed_case("sigma breaks a tie on spread", DRIFT,
            {2.0: 0.020,
             4.0: (-0.005, 0.005, -0.005, 0.005),
             6.0: (-0.005, 0.0, 0.005, 0.0),
-            8.0: 0.030}, 6.0, 34)
+            8.0: 0.030}, 6.0)
 
 # One speed has no usable threshold at all - it is skipped, not fatal
 speed_case("a speed with no usable threshold is skipped",
            {2.0: (20, 40), 4.0: (60, 55), 6.0: (34, 62), 8.0: (44, 78)},
-           {2.0: 0.030, 4.0: 0.001, 6.0: 0.008, 8.0: 0.020}, 6.0, 34)
+           {2.0: 0.030, 4.0: 0.001, 6.0: 0.008, 8.0: 0.020}, 6.0)
 
 # No speed works at all
 speed_case("no speed works",
            {2.0: (200, 100), 4.0: (200, 100), 6.0: (200, 100),
-            8.0: (200, 100)}, {}, None, None,
+            8.0: (200, 100)}, {}, None,
            expect_error="no speed produced a usable tap_thresh")
 
 
@@ -911,7 +918,9 @@ def restart_case():
         assert first == mod.TAP_FLOOR_CODE, \
             "%g mm/s started at reg %d" % (speed, first)
     # 4 mm/s is both more accurate and lower in the range
-    assert sim.chip.regs[0x1D] == 20, "reg %d" % sim.chip.regs[0x1D]
+    assert sim.chip.regs[0x1D] == wrapper._tap_code(
+        walk_lands_on(wrapper, *bands[4.0])), \
+        "reg %d" % sim.chip.regs[0x1D]
     assert float(sim.configfile.saved[('adxl345_probe', 'speed')]) == 4.
     print("  -> both walks restarted at 1000 mm/s^2, ok")
 
@@ -976,9 +985,9 @@ def intermittent_case():
     not good enough: the walk carries on up instead of failing the speed."""
     import extras.adxl345_probe as mod
     sim = Sim(28, 200)
-    # The first rung of the ladder at or above the misfire edge is 17420
-    # mm/s^2, register 28. Make that one work once and then misfire.
-    sim.flaky_code = 28
+    # The first rung of the ladder at or above the misfire edge is 18000
+    # mm/s^2, register 29. Make that one work once and then misfire.
+    sim.flaky_code = 29
     wrapper = build(sim, mod)
     log = []
     gcmd = GCmd({'SPEED_START': 5, 'SPEED_END': 5, 'SPEED_STEP': 1,
