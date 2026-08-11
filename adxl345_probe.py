@@ -658,40 +658,44 @@ class ADXL345EndstopWrapper:
                     "tap_thresh %.0f already misses the bed" % (thresh,))
             if verdict == 'sensitive':
                 continue
-            # First tap of the sequence: no accuracy to report yet, so report
-            # where it triggered
-            gcmd.respond_info(
-                "  speed %5.1f  tap_thresh %6.0f  tapped at z %s"
-                % (speed, thresh,
-                   "%.4f" % (z,) if z is not None else "unknown"))
             # It tapped. Measure that pair here, on this spot, `samples` times,
             # lifting `lift` mm between taps rather than returning to the start
             # height. No scatter: the point is to measure the probe, and moving
             # between taps would measure the bed as well. The tap that found
-            # the threshold is not counted - it descended from the start height
-            # rather than from `lift`, so it is not the same measurement.
+            # the threshold is not one of them: it descended from the start
+            # height at a scattered point, so it is not the same measurement.
             zs = []
             from_z = (z if z is not None
                       else self.printer.lookup_object(
                           'toolhead').get_position()[2]) + lift
             failed = None
-            for _ in range(samples):
+            for n in range(1, samples + 1):
                 verdict, detail, z = self._tap(probe_gcmd, from_z, lift_speed,
                                                start_z, scatter=False)
                 if verdict != 'pass':
                     failed = (verdict, detail)
                     break
-                if z is not None:
-                    zs.append(z)
-                    from_z = z + lift
+                if z is None:
+                    continue
+                zs.append(z)
+                from_z = z + lift
+                # One tap is not an accuracy, so the first reports the height
+                # it triggered at. After that the average is recomputed and
+                # reported as it settles.
+                if len(zs) == 1:
+                    gcmd.respond_info(
+                        "  tap %-4s speed %5.1f  tap_thresh %6.0f  tapped at"
+                        " z %.4f" % ("#%d:" % (n,), speed, thresh, z))
+                else:
+                    gcmd.respond_info(
+                        "  tap %-4s speed %5.1f  tap_thresh %6.0f  accuracy"
+                        " %.4f" % ("#%d:" % (n,), speed, thresh,
+                                   sum(zs) / len(zs)))
             if failed is None and len(zs) >= 2:
                 mean = sum(zs) / len(zs)
                 spread = max(zs) - min(zs)
                 sigma = math.sqrt(sum((v - mean) ** 2 for v in zs)
                                   / len(zs))
-                gcmd.respond_info(
-                    "  speed %5.1f  tap_thresh %6.0f  accuracy %.4f"
-                    % (speed, thresh, mean))
                 self._lift_to(start_z, lift_speed)
                 return {'speed': speed, 'thresh': thresh, 'mean': mean,
                         'spread': spread, 'sigma': sigma, 'samples': len(zs)}
@@ -752,8 +756,8 @@ class ADXL345EndstopWrapper:
                    if self._tap_code(t) <= TAP_GRAVITY_CODE)
         gcmd.respond_info(
             "ADXL_PROBE_CALIBRATE: speeds %s mm/s, tap_thresh %.0f - %.0f"
-            " mm/s^2 in %d step(s)%s, %d taps per measurement. Only the two"
-            " lines that matter are logged per speed - the climb is quiet."
+            " mm/s^2 in %d step(s)%s, %d taps per measurement. The climb is"
+            " quiet; every measuring tap reports the average so far."
             % (", ".join("%g" % s for s in speeds), thresholds[0],
                thresholds[-1], len(thresholds),
                "" if not dead else " (the first %d are at or below 1g and are"

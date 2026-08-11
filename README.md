@@ -484,30 +484,32 @@ kept inside the circle.
 ### Reading the output
 
 The climb is quiet — a misfire is the expected outcome of a threshold that is
-still too low, and one line per register step buries the two that matter in
-hundreds. Each speed reports where it first tapped and what that pair measured:
+still too low, and one line per register step buries the results in hundreds.
+What gets logged is the measurement: every tap of it, with the average
+recomputed as it settles.
 
 ```
 ADXL_PROBE_CALIBRATE: probing at X0.000 Y0.000 from Z10.000, climbing over X-20.000-20.000 Y-20.000-20.000
-ADXL_PROBE_CALIBRATE: speeds 10, 12, 14, 16 mm/s, tap_thresh 10000 - 100000 mm/s^2 in 91 step(s) (the first 1 are at or below 1g and are skipped), 10 taps per measurement. ...
-  speed  10.0  tap_thresh  25000  tapped at z 0.0173
-  speed  10.0  tap_thresh  25000  accuracy 0.0183
-  speed  12.0  tap_thresh  27000  tapped at z 0.0174
-  speed  12.0  tap_thresh  27000  accuracy 0.0196
-  speed  14.0  tap_thresh  30000  tapped at z 0.0236
-  speed  14.0  tap_thresh  30000  accuracy 0.0209
+ADXL_PROBE_CALIBRATE: speeds 10, 12 mm/s, tap_thresh 10000 - 100000 mm/s^2 in 91 step(s) (the first 1 are at or below 1g and are skipped), 10 taps per measurement. ...
+  tap #1:  speed  10.0  tap_thresh  25000  tapped at z 0.0187
+  tap #2:  speed  10.0  tap_thresh  25000  accuracy 0.0193
+  tap #3:  speed  10.0  tap_thresh  25000  accuracy 0.0182
+  tap #4:  speed  10.0  tap_thresh  25000  accuracy 0.0180
+  ...
+  tap #10: speed  10.0  tap_thresh  25000  accuracy 0.0183
+  tap #1:  speed  12.0  tap_thresh  27000  tapped at z 0.0211
+  ...
 ADXL_PROBE_CALIBRATE: results, best first
   1. speed  10.0  tap_thresh  25000  average z 0.0183  range 0.0040  sigma 0.0015  (10 taps)
-  2. speed  12.0  tap_thresh  27000  average z 0.0196  range 0.0044  sigma 0.0015  (10 taps)
-  3. speed  14.0  tap_thresh  30000  average z 0.0209  range 0.0048  sigma 0.0018  (10 taps)
+  2. speed  12.0  tap_thresh  27000  average z 0.0218  range 0.0040  sigma 0.0014  (10 taps)
 ```
 
-`tapped at z` is the first tap that worked, before there is any accuracy to
-report — the height the walk finally felt the bed at. `accuracy` is the average
-trigger height of the taps that followed it, on that same spot, and it is what
-the speeds are ranked by.
+`tap #1` reports the height it triggered at, because one tap is not an accuracy
+yet. From `tap #2` on, each line is the average of every tap so far at that
+threshold and speed, so you can watch it converge — and see immediately if it
+does not. The last one is the figure the speeds are ranked by.
 
-The results table adds `range` and `sigma` for each pair. They are worth a look
+The results table adds `range` and `sigma` per pair. They are worth a look
 before trusting the ranking: a range much larger than the differences between
 speeds means the averages are inside the noise, and `probe_accel` is the first
 thing to look at.
