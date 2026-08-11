@@ -1305,28 +1305,29 @@ restart_case()
 
 
 def accuracy_lift_case():
-    """The accuracy taps lift LIFT mm between them, not back to Z, and the
-    walk taps once at each threshold before that."""
+    """The accuracy taps lift LIFT mm above the last trigger between them, not
+    back to Z, and the walk taps from Z every time."""
     import extras.adxl345_probe as mod
     sim = Sim(28, 200)
     wrapper = build(sim, mod)
     sim.toolhead.moves = []
     log = []
     gcmd = GCmd({'SPEED_START': 5, 'SPEED_END': 5, 'SPEED_STEP': 1,
-                 'SAMPLES': 5, 'DEVIATION': 0}, log, quiet=True)
-    print("\n=== accuracy run: 1 mm lifts ===")
+                 'SAMPLES': 5, 'DEVIATION': 0, 'Z': 12, 'LIFT': 4},
+                log, quiet=True)
+    print("\n=== accuracy run: LIFT mm above the last trigger ===")
     wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
     lifts = [round(pos[2], 4) for pos, _sp in sim.toolhead.moves]
     print("  lift targets: %s" % lifts)
-    # One tap per misfiring threshold from the start height, then the accuracy
-    # run just above the bed
-    assert lifts.count(10.0) >= 2, "walk did not descend from Z10: %s" % lifts
-    near_bed = [z for z in lifts if z < 5.]
-    assert len(near_bed) >= 3, "no 1 mm lifts: %s" % lifts
-    for z in near_bed:
-        assert 1.0 <= z <= 1.1, "lifted to %.4f, expected ~1 mm" % z
-    print("  -> %d taps from ~1 mm, %d from Z10, ok"
-          % (len(near_bed), lifts.count(10.0)))
+    # One tap per misfiring threshold from the start height, then the
+    # measurement from LIFT above where the last one triggered
+    assert lifts.count(12.0) >= 2, "walk did not descend from Z12: %s" % lifts
+    measured = [z for z in lifts if z < 12.]
+    assert len(measured) >= 3, "no LIFT-height taps: %s" % lifts
+    for z in measured:
+        assert 4.0 <= z <= 4.1, "lifted to %.4f, expected ~4 mm" % z
+    print("  -> %d taps from ~4 mm, %d from Z12, ok"
+          % (len(measured), lifts.count(12.0)))
 
 
 accuracy_lift_case()
@@ -1357,24 +1358,25 @@ lift_guard_case()
 
 
 def lift_default_case():
-    """LIFT defaults to twice min_probe_travel, so a machine that demands more
-    travel than usual does not have to be told about it."""
+    """LIFT defaults to CAL_LIFT, or twice min_probe_travel when that is more -
+    a machine that demands unusual travel does not have to be told about it."""
     import extras.adxl345_probe as mod
-    print("\n=== accuracy run: LIFT follows min_probe_travel ===")
-    for travel, want_lift in ((0.5, 1.0), (1.5, 3.0), (0., 1.0)):
+    print("\n=== accuracy run: the LIFT default ===")
+    for travel, want_lift in ((0.5, mod.CAL_LIFT), (1.5, mod.CAL_LIFT),
+                              (0., mod.CAL_LIFT), (12., 24.)):
         sim = Sim(28, 200)
         wrapper = build(sim, mod, {'min_probe_travel': travel})
         sim.toolhead.moves = []
         gcmd = GCmd({'SPEED_START': 5, 'SPEED_END': 5, 'SPEED_STEP': 1,
-                     'SAMPLES': 4, 'DEVIATION': 0}, [], quiet=True)
+                     'SAMPLES': 4, 'DEVIATION': 0, 'Z': 40}, [], quiet=True)
         wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
         # The accuracy taps lift from the last trigger, so the height they
-        # start from is trigger + LIFT
-        near_bed = [pos[2] for pos, _sp in sim.toolhead.moves if pos[2] < 5.]
-        assert near_bed, "no accuracy taps ran"
-        got = min(near_bed) - sim.trigger_z
-        print("  min_probe_travel %.1f -> lifts to ~%.2f, so LIFT is %.2f"
-              % (travel, min(near_bed), got))
+        # start from is trigger + LIFT. The walk descends from Z=40.
+        measured = [pos[2] for pos, _sp in sim.toolhead.moves if pos[2] < 40.]
+        assert measured, "no accuracy taps ran"
+        got = min(measured) - sim.trigger_z
+        print("  min_probe_travel %4.1f -> lifts to ~%5.2f, so LIFT is %5.2f"
+              % (travel, min(measured), got))
         assert abs(got - want_lift) < 0.01, \
             "LIFT came out as %.3f, expected %.3f" % (got, want_lift)
     print("  -> ok")
@@ -1469,15 +1471,15 @@ def position_case(name, homed, params, want_xy, want_z, want_homing,
 
 # axis_maximum in the stub is 300 x 220, so the middle is 150, 110
 position_case("bare command homes and centres itself", '', {},
-              (150.0, 110.0), 10.0, 1)
-position_case("already homed, no G28", 'xyz', {}, (150.0, 110.0), 10.0, 0)
+              (150.0, 110.0), 20.0, 1)
+position_case("already homed, no G28", 'xyz', {}, (150.0, 110.0), 20.0, 0)
 position_case("Z overridden", 'xyz', {'Z': 15}, (150.0, 110.0), 15.0, 0)
 position_case("X/Y overridden", 'xyz', {'X': 42, 'Y': 17, 'Z': 5},
               (42.0, 17.0), 5.0, 0)
 position_case("partially homed still homes", 'xy', {}, (150.0, 110.0),
-              10.0, 1)
+              20.0, 1)
 position_case("nozzle starts on the bed - lifts before traversing", 'xyz',
-              {}, (150.0, 110.0), 10.0, 0, start_pos=[5., 5., 0.2])
+              {}, (150.0, 110.0), 20.0, 0, start_pos=[5., 5., 0.2])
 position_case("G28 that does not home everything is an error", '', {}, None,
               None, 1, expect_error="G28 did not home", home_result='xy')
 # A delta homes at the top of the travel, where the reachable radius is nil.
@@ -1485,10 +1487,10 @@ position_case("G28 that does not home everything is an error", '', {}, None,
 DELTA_RANGE = (Coord(x=-150., y=-150., z=-5.),
                Coord(x=150., y=150., z=419.685))
 position_case("delta: descends before traversing", 'xyz', {},
-              (0.0, 0.0), 10.0, 0, start_pos=[0.31, -0.44, 419.685],
+              (0.0, 0.0), 20.0, 0, start_pos=[0.31, -0.44, 419.685],
               axis_range=DELTA_RANGE)
 position_case("delta: homes, then descends before traversing", '', {},
-              (0.0, 0.0), 10.0, 1, axis_range=DELTA_RANGE)
+              (0.0, 0.0), 20.0, 1, axis_range=DELTA_RANGE)
 
 
 # --- DEVIATION -----------------------------------------------------

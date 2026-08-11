@@ -83,11 +83,12 @@ CAL_ACCURACY_MAX = 0.1
 # no more, but a machine that faults on every tap is not going to recover by
 # being asked another hundred times.
 CAL_MAX_FAULTS = 3
-# The nozzle rises this far between those taps, and the descent that follows
-# has to be longer than min_probe_travel or the trigger counts as a misfire.
-# Twice that is the default, and this is the floor when it is 0.
-CAL_LIFT_FLOOR = 1.
-CAL_Z = 10.  # height the first tap of each threshold descends from
+# The nozzle rises this far between the taps of a measurement, so it is also
+# how far the next one descends. Enough travel to reach the probing speed
+# whatever probe_accel is set to, and it has to clear min_probe_travel or every
+# trigger would count as a misfire - hence the max() against twice that.
+CAL_LIFT = 15.
+CAL_Z = 20.  # height the first tap of each threshold descends from
 CAL_TRAVEL_SPEED = 50.  # mm/s for the move to the probing point
 CAL_DEVIATION = 20.  # mm of X/Y scatter around the probing point, 0 = off
 CAL_SCATTER_TRIES = 10  # draws before giving up on landing on a round bed
@@ -911,8 +912,9 @@ class ADXL345EndstopWrapper:
         speeds = self._speeds(gcmd)
         samples = gcmd.get_int('SAMPLES', CAL_SAMPLES, minval=2, maxval=100)
         worst = gcmd.get_float('ACCURACY_MAX', CAL_ACCURACY_MAX, above=0.)
-        lift = gcmd.get_float('LIFT', max(2. * self.min_probe_travel,
-                                          CAL_LIFT_FLOOR), above=0.)
+        lift = gcmd.get_float('LIFT', max(CAL_LIFT,
+                                          2. * self.min_probe_travel),
+                              above=0.)
         if lift <= self.min_probe_travel:
             # Every tap of the accuracy run would trigger inside
             # min_probe_travel and be read as a misfire, so the walk would

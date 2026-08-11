@@ -373,7 +373,7 @@ ADXL_PROBE_CALIBRATE
 ```
 
 That is the whole thing. It homes if any axis is unhomed, travels to the middle
-of the bed and probes from `Z=10` — no `G28`/`G1` preamble. Pass `X=`, `Y=` or
+of the bed and probes from `Z=20` — no `G28`/`G1` preamble. Pass `X=`, `Y=` or
 `Z=` to override any of that.
 
 It refuses to start while a print is running or paused — see
@@ -476,8 +476,8 @@ started from, and stages nothing.
 | `DEVIATION` | `20` | Half-width in mm of the square around `X`/`Y` that the **walk's** taps are scattered over, so the climb does not dent one spot. Each tap of the walk picks a fresh random point in `X±dev`, `Y±dev`. The accuracy measurement never moves, whatever this is set to. `0` puts everything on the same spot. |
 | `SAMPLES` | `10` | Taps per accuracy measurement. This is the number the ranking is built on — don't set it below about 5. |
 | `ACCURACY_MAX` | `0.1` | Worst accuracy in mm that counts as a measurement. Beyond that the threshold is treated as unusable and the walk carries on up, the same as for a misfire. |
-| `LIFT` | 2 × `min_probe_travel` | How far the nozzle rises between those taps, in mm, and therefore how far the next one descends. Must be above `min_probe_travel`, or every tap would trigger inside it and be read as a misfire — so the default is twice it, and the command refuses to start if you pass less. Never below 1 mm, for a `min_probe_travel` of 0. |
-| `Z` | `10` | Height the first tap at each threshold descends from. Must clear anything on the bed. The move to the probing point also happens at this height — on a delta the reachable radius near the top of the travel is nil, so traversing at the height `G28` finishes at is out of range. |
+| `LIFT` | `15`, or 2 × `min_probe_travel` if that is more | How far the nozzle rises between the taps of a measurement, in mm, and therefore how far the next one descends. Enough travel to reach the probing speed whatever `probe_accel` is set to. It must clear `min_probe_travel`, or every tap would trigger inside it and be read as a misfire — hence the floor of twice that, and the command refuses to start if you pass less. |
+| `Z` | `20` | Height the first tap at each threshold descends from. Must clear anything on the bed. The move to the probing point also happens at this height — on a delta the reachable radius near the top of the travel is nil, so traversing at the height `G28` finishes at is out of range. |
 | `TRAVEL_SPEED` | `50` | mm/s for the moves to the probing point. Not the probing speed — that is what the command is measuring. |
 | `CHIP` | — | Accelerometer name, matching `chip:`. Optional; only useful if you have named your `[adxl345]` section. |
 
@@ -612,7 +612,7 @@ What gets logged is the measurement: every tap of it, with the average
 recomputed as it settles.
 
 ```
-ADXL_PROBE_CALIBRATE: probing at X0.000 Y0.000 from Z10.000, climbing over X-20.000-20.000 Y-20.000-20.000
+ADXL_PROBE_CALIBRATE: probing at X0.000 Y0.000 from Z20.000, climbing over X-20.000-20.000 Y-20.000-20.000
 ADXL_PROBE_CALIBRATE: speeds 10, 12 mm/s, tap_thresh 10000 - 100000 mm/s^2 in 91 step(s) (the first 1 are at or below 1g and are skipped), 10 taps per measurement. ...
   tap #1:  speed  10.0  tap_thresh  25000  tapped at z -0.0187
   tap #2:  speed  10.0  tap_thresh  25000  accuracy 0.0193
