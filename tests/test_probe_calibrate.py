@@ -533,11 +533,11 @@ def defaults_case():
 
 def floor_case():
     """The walk starts wherever THRESHOLD_START says, including below 1g. Those
-    rungs are reported and stepped over, never probed: a probe there would
-    drive the nozzle to the descent floor to demonstrate what the register
-    value already proves."""
+    rungs are stepped over, never probed: a probe there would drive the nozzle
+    to the descent floor to demonstrate what the register value already
+    proves."""
     import extras.adxl345_probe as mod
-    for start, want_skips in ((None, 1), (1000, 10)):
+    for start, want_dead in ((None, 1), (1000, 10)):
         sim = Sim(30, 200)
         wrapper = build(sim, mod)
         log = []
@@ -546,15 +546,17 @@ def floor_case():
             args['THRESHOLD_START'] = start
         gcmd = GCmd(args, log, quiet=True)
         wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
-        skipped = [ln for ln in log if 'not probed' in ln]
         dead = [c for _sp, c in sim.tested if c <= mod.TAP_GRAVITY_CODE]
+        announced = [ln for ln in log
+                     if 'at or below 1g and are skipped' in ln]
         print("\n=== 1g floor: THRESHOLD_START=%s ==="
               % (start if start is not None else 'default',))
-        print("  %d rungs reported without probing, first probed reg %d"
-              % (len(skipped), sim.tested[0][1]))
+        print("  first probed reg %d, %d dead rungs announced up front"
+              % (sim.tested[0][1], want_dead))
         assert not dead, "probed registers %s, at or below 1g" % (dead,)
-        assert len(skipped) == want_skips, \
-            "%d rungs skipped, expected %d" % (len(skipped), want_skips)
+        assert announced, "the dead rungs were not announced"
+        assert "the first %d are" % want_dead in announced[0], \
+            "announced %r, expected %d dead rungs" % (announced[0], want_dead)
         assert sim.tested[0][1] == mod.TAP_FLOOR_CODE, \
             "first probe was reg %d" % sim.tested[0][1]
     print("  -> ok")

@@ -633,19 +633,15 @@ class ADXL345EndstopWrapper:
                 # cost a full-depth descent with the nozzle loaded against the
                 # bed for the whole of it, to learn what the register value
                 # already says.
-                gcmd.respond_info(
-                    "  speed %5.1f  tap_thresh %6.0f (reg %3d): %-9s at or"
-                    " below 1g, no tap can latch there - not probed"
-                    % (speed, thresh, self._tap_code(thresh), 'skipped'))
                 continue
             self.tap_thresh = thresh
             self._write_tap_regs()
             probed.append(thresh)
             verdict, detail, z = self._tap(probe_gcmd, start_z, lift_speed,
                                            start_z)
-            gcmd.respond_info(
-                "  speed %5.1f  tap_thresh %6.0f (reg %3d): %-9s %s"
-                % (speed, thresh, self._tap_code(thresh), verdict, detail))
+            # Nothing is logged for the climb itself. A misfire is the expected
+            # outcome of a threshold that is still too low, and one line per
+            # register step buries the two lines that matter in hundreds.
             if verdict == 'deaf':
                 # Nothing higher can be more sensitive than this was. If even
                 # the first one probed missed, the fault is upstream of
@@ -662,6 +658,12 @@ class ADXL345EndstopWrapper:
                     "tap_thresh %.0f already misses the bed" % (thresh,))
             if verdict == 'sensitive':
                 continue
+            # First tap of the sequence: no accuracy to report yet, so report
+            # where it triggered
+            gcmd.respond_info(
+                "  speed %5.1f  tap_thresh %6.0f  tapped at z %s"
+                % (speed, thresh,
+                   "%.4f" % (z,) if z is not None else "unknown"))
             # It tapped. Measure that pair here, on this spot, `samples` times,
             # lifting `lift` mm between taps rather than returning to the start
             # height. No scatter: the point is to measure the probe, and moving
@@ -688,9 +690,8 @@ class ADXL345EndstopWrapper:
                 sigma = math.sqrt(sum((v - mean) ** 2 for v in zs)
                                   / len(zs))
                 gcmd.respond_info(
-                    "  speed %5.1f  tap_thresh %6.0f: %d taps at one spot,"
-                    " average z %.4f (range %.4f sigma %.4f)"
-                    % (speed, thresh, len(zs), mean, spread, sigma))
+                    "  speed %5.1f  tap_thresh %6.0f  accuracy %.4f"
+                    % (speed, thresh, mean))
                 self._lift_to(start_z, lift_speed)
                 return {'speed': speed, 'thresh': thresh, 'mean': mean,
                         'spread': spread, 'sigma': sigma, 'samples': len(zs)}
@@ -702,10 +703,8 @@ class ADXL345EndstopWrapper:
                     "tap_thresh %.0f misses the bed part way through the"
                     " accuracy run" % (thresh,))
             gcmd.respond_info(
-                "  speed %5.1f  tap_thresh %6.0f: only %d of %d taps worked"
-                " (%s) - raising tap_thresh"
-                % (speed, thresh, len(zs), samples,
-                   failed[1] if failed else "no trigger position reported"))
+                "  speed %5.1f  tap_thresh %6.0f  only %d of %d taps worked -"
+                " raising tap_thresh" % (speed, thresh, len(zs), samples))
         raise self.NoThreshold(
             "every tap_thresh from %.0f to %.0f mm/s^2 misfired"
             % (probed[0], probed[-1]))
@@ -753,14 +752,12 @@ class ADXL345EndstopWrapper:
                    if self._tap_code(t) <= TAP_GRAVITY_CODE)
         gcmd.respond_info(
             "ADXL_PROBE_CALIBRATE: speeds %s mm/s, tap_thresh %.0f - %.0f"
-            " mm/s^2 in %d step(s)%s, %d taps per measurement. Every speed"
-            " starts over at %.0f mm/s^2."
+            " mm/s^2 in %d step(s)%s, %d taps per measurement. Only the two"
+            " lines that matter are logged per speed - the climb is quiet."
             % (", ".join("%g" % s for s in speeds), thresholds[0],
                thresholds[-1], len(thresholds),
-               "" if not dead else
-               " of which the first %d are at or below 1g and are reported"
-               " without being probed" % (dead,),
-               samples, thresholds[0]))
+               "" if not dead else " (the first %d are at or below 1g and are"
+               " skipped)" % (dead,), samples))
 
         self.start_probe_session(gcmd)
         self.managed_session = True
@@ -902,17 +899,12 @@ class ADXL345EndstopWrapper:
         # from.
         toolhead.manual_move([None, None, z], travel)
         toolhead.manual_move([x, y, None], travel)
-        gcmd.respond_info("ADXL_PROBE_CALIBRATE: probing at X%.3f Y%.3f from"
-                          " Z%.3f" % (x, y, z))
-        if dev:
-            area = self.cal_point
-            gcmd.respond_info(
-                "ADXL_PROBE_CALIBRATE: scattering the taps over X%.3f-%.3f"
-                " Y%.3f-%.3f (DEVIATION=%g). Any tilt or unevenness across"
-                " that area lands in the measured accuracy, so keep it small"
-                " enough that the bed is flat within it."
-                % (area['x_lo'], area['x_hi'], area['y_lo'], area['y_hi'],
-                   dev))
+        area = self.cal_point
+        gcmd.respond_info(
+            "ADXL_PROBE_CALIBRATE: probing at X%.3f Y%.3f from Z%.3f%s"
+            % (x, y, z, "" if not dev else
+               ", climbing over X%.3f-%.3f Y%.3f-%.3f"
+               % (area['x_lo'], area['x_hi'], area['y_lo'], area['y_hi'])))
         return z
 
     # The square of half-width `dev` around (x, y), clipped to the travel the

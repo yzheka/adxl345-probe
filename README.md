@@ -483,38 +483,39 @@ kept inside the circle.
 
 ### Reading the output
 
+The climb is quiet — a misfire is the expected outcome of a threshold that is
+still too low, and one line per register step buries the two that matter in
+hundreds. Each speed reports where it first tapped and what that pair measured:
+
 ```
-ADXL_PROBE_CALIBRATE: probing at X0.000 Y0.000 from Z10.000
-ADXL_PROBE_CALIBRATE: scattering the taps over X-20.000-20.000 Y-20.000-20.000 (DEVIATION=20). ...
-  speed  10.0  tap_thresh  10000 (reg  16): skipped   at or below 1g, no tap can latch there - not probed
-  speed  10.0  tap_thresh  11000 (reg  17): sensitive Probe triggered prior to movement
-  speed  10.0  tap_thresh  12000 (reg  19): sensitive Probe triggered prior to movement
-  ... one line per step up ...
-  speed  10.0  tap_thresh  33000 (reg  53): sensitive Probe triggered prior to movement
-  speed  10.0  tap_thresh  34000 (reg  55): pass      triggered at z 0.0193
-  speed  10.0  tap_thresh  34000: 10 taps at one spot, average z 0.0180 (range 0.0031 sigma 0.0011)
-  speed  12.0  tap_thresh  10000 (reg  16): skipped   at or below 1g, no tap can latch there - not probed
-  ...
+ADXL_PROBE_CALIBRATE: probing at X0.000 Y0.000 from Z10.000, climbing over X-20.000-20.000 Y-20.000-20.000
+ADXL_PROBE_CALIBRATE: speeds 10, 12, 14, 16 mm/s, tap_thresh 10000 - 100000 mm/s^2 in 91 step(s) (the first 1 are at or below 1g and are skipped), 10 taps per measurement. ...
+  speed  10.0  tap_thresh  25000  tapped at z 0.0173
+  speed  10.0  tap_thresh  25000  accuracy 0.0183
+  speed  12.0  tap_thresh  27000  tapped at z 0.0174
+  speed  12.0  tap_thresh  27000  accuracy 0.0196
+  speed  14.0  tap_thresh  30000  tapped at z 0.0236
+  speed  14.0  tap_thresh  30000  accuracy 0.0209
 ADXL_PROBE_CALIBRATE: results, best first
-  1. speed  10.0  tap_thresh  34000  average z 0.0180  range 0.0031  sigma 0.0011  (10 taps)
-  2. speed  12.0  tap_thresh  37000  average z 0.0224  range 0.0044  sigma 0.0016  (10 taps)
+  1. speed  10.0  tap_thresh  25000  average z 0.0183  range 0.0040  sigma 0.0015  (10 taps)
+  2. speed  12.0  tap_thresh  27000  average z 0.0196  range 0.0044  sigma 0.0015  (10 taps)
+  3. speed  14.0  tap_thresh  30000  average z 0.0209  range 0.0048  sigma 0.0018  (10 taps)
 ```
 
-The `sensitive` lines are the climb — each one is a probe that misfired without
-touching the bed. The single `pass` is where the walk stops. The line after it is
-the accuracy measurement: ten taps on that one spot, at that one threshold and
-speed.
+`tapped at z` is the first tap that worked, before there is any accuracy to
+report — the height the walk finally felt the bed at. `accuracy` is the average
+trigger height of the taps that followed it, on that same spot, and it is what
+the speeds are ranked by.
 
-`average z` is what the speeds are ranked by — how far past the surface the
-effector carried before the chip saw the contact — and the smaller `range`
-breaks ties. `range` and `sigma` are reported for information: a range much
-larger than the differences between speeds means the ranking is not telling you
-much, and `probe_accel` is the first thing to look at.
+The results table adds `range` and `sigma` for each pair. They are worth a look
+before trusting the ranking: a range much larger than the differences between
+speeds means the averages are inside the noise, and `probe_accel` is the first
+thing to look at.
 
-An average that grows steadily with speed is the normal picture: a faster probe
+An average that grows steadily with speed is the normal picture — a faster probe
 hits harder and needs a higher threshold, and a higher threshold lets the nozzle
 travel further before latching. A speed reported as `unusable` is not a fault:
-it means no threshold in the range worked there, the run says so and carries on.
+no threshold in the range worked there, the run says so and carries on.
 
 ### Failure messages
 
