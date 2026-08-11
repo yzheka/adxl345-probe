@@ -1031,6 +1031,33 @@ def lift_guard_case():
 lift_guard_case()
 
 
+def lift_default_case():
+    """LIFT defaults to twice min_probe_travel, so a machine that demands more
+    travel than usual does not have to be told about it."""
+    import extras.adxl345_probe as mod
+    print("\n=== accuracy run: LIFT follows min_probe_travel ===")
+    for travel, want_lift in ((0.5, 1.0), (1.5, 3.0), (0., 1.0)):
+        sim = Sim(28, 200)
+        wrapper = build(sim, mod, {'min_probe_travel': travel})
+        sim.toolhead.moves = []
+        gcmd = GCmd({'SPEED_START': 5, 'SPEED_END': 5, 'SPEED_STEP': 1,
+                     'SAMPLES': 4, 'DEVIATION': 0}, [], quiet=True)
+        wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
+        # The accuracy taps lift from the last trigger, so the height they
+        # start from is trigger + LIFT
+        near_bed = [pos[2] for pos, _sp in sim.toolhead.moves if pos[2] < 5.]
+        assert near_bed, "no accuracy taps ran"
+        got = min(near_bed) - sim.trigger_z
+        print("  min_probe_travel %.1f -> lifts to ~%.2f, so LIFT is %.2f"
+              % (travel, min(near_bed), got))
+        assert abs(got - want_lift) < 0.01, \
+            "LIFT came out as %.3f, expected %.3f" % (got, want_lift)
+    print("  -> ok")
+
+
+lift_default_case()
+
+
 def intermittent_case():
     """A threshold that taps once but breaks down during the accuracy run is
     not good enough: the walk carries on up instead of failing the speed."""

@@ -418,7 +418,7 @@ and stages nothing.
 | `Y` | middle of the bed | As `X`, less `y_offset`. |
 | `DEVIATION` | `20` | Half-width in mm of the square around `X`/`Y` that the **walk's** taps are scattered over, so the climb does not dent one spot. Each tap of the walk picks a fresh random point in `X±dev`, `Y±dev`. The accuracy measurement never moves, whatever this is set to. `0` puts everything on the same spot. |
 | `SAMPLES` | `10` | Taps per accuracy measurement. This is the number the ranking is built on — don't set it below about 5. |
-| `LIFT` | `1.0` | How far the nozzle rises between those taps, in mm. Must be above `min_probe_travel`, or every tap would trigger inside it and be read as a misfire; the command refuses to start otherwise. |
+| `LIFT` | 2 × `min_probe_travel` | How far the nozzle rises between those taps, in mm, and therefore how far the next one descends. Must be above `min_probe_travel`, or every tap would trigger inside it and be read as a misfire — so the default is twice it, and the command refuses to start if you pass less. Never below 1 mm, for a `min_probe_travel` of 0. |
 | `Z` | `10` | Height the first tap at each threshold descends from. Must clear anything on the bed. The move to the probing point also happens at this height — on a delta the reachable radius near the top of the travel is nil, so traversing at the height `G28` finishes at is out of range. |
 | `TRAVEL_SPEED` | `50` | mm/s for the moves to the probing point. Not the probing speed — that is what the command is measuring. |
 | `CHIP` | — | Accelerometer name, matching `chip:`. Optional; only useful if you have named your `[adxl345]` section. |
@@ -594,7 +594,7 @@ no threshold in the range worked there, the run says so and carries on.
 | `speed N: unusable - tap_thresh M already misses the bed` | The band ended below where the walk reached. Usually means the previous speed's band was much lower. |
 | `speed N: unusable - tap_thresh M misses the bed part way through the accuracy run` | It tapped once, then stopped feeling the bed. Usually a bed that is deflecting under repeated contact. |
 | `only N of M taps worked (...) - raising tap_thresh` | Not a failure: that threshold is marginal, and the walk is carrying on upward. |
-| `LIFT=x is not above min_probe_travel=y` | The accuracy taps would trigger inside `min_probe_travel` and be read as misfires. Raise `LIFT` above it. |
+| `LIFT=x is not above min_probe_travel=y` | The accuracy taps would trigger inside `min_probe_travel` and be read as misfires. Leave `LIFT` out and it defaults to twice `min_probe_travel`. |
 
 ### Running during a print
 

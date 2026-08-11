@@ -72,7 +72,10 @@ CAL_SPEED_END = 30.
 CAL_SPEED_STEP = 2.
 CAL_MAX_SPEEDS = 20
 CAL_SAMPLES = 10  # taps per accuracy measurement
-CAL_LIFT = 1.  # mm the nozzle rises between those taps
+# The nozzle rises this far between those taps, and the descent that follows
+# has to be longer than min_probe_travel or the trigger counts as a misfire.
+# Twice that is the default, and this is the floor when it is 0.
+CAL_LIFT_FLOOR = 1.
 CAL_Z = 10.  # height the first tap of each threshold descends from
 CAL_TRAVEL_SPEED = 50.  # mm/s for the move to the probing point
 CAL_DEVIATION = 20.  # mm of X/Y scatter around the probing point, 0 = off
@@ -735,7 +738,8 @@ class ADXL345EndstopWrapper:
         thresholds = self._thresholds(gcmd)
         speeds = self._speeds(gcmd)
         samples = gcmd.get_int('SAMPLES', CAL_SAMPLES, minval=2, maxval=100)
-        lift = gcmd.get_float('LIFT', CAL_LIFT, above=0.)
+        lift = gcmd.get_float('LIFT', max(2. * self.min_probe_travel,
+                                          CAL_LIFT_FLOOR), above=0.)
         if lift <= self.min_probe_travel:
             # Every tap of the accuracy run would trigger inside
             # min_probe_travel and be read as a misfire, so the walk would
@@ -743,8 +747,9 @@ class ADXL345EndstopWrapper:
             raise gcmd.error(
                 "ADXL_PROBE_CALIBRATE: LIFT=%.3f is not above"
                 " min_probe_travel=%.3f, so every tap of the accuracy run"
-                " would look like a misfire. Raise LIFT."
-                % (lift, self.min_probe_travel))
+                " would look like a misfire. Raise LIFT above %.3f, or leave"
+                " it out and it defaults to twice min_probe_travel."
+                % (lift, self.min_probe_travel, self.min_probe_travel))
         start_z = self._move_to_probe_point(gcmd)
         lift_speed = self.param_helper.get_probe_params(gcmd)['lift_speed']
         saved_thresh = self.tap_thresh
