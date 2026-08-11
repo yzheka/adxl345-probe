@@ -200,7 +200,7 @@ Standard Klipper probe parameters, handled by `probe.ProbeParameterHelper`.
 | Command | Description |
 | ------- | ----------- |
 | `SET_ACCEL_PROBE [TAP_THRESH=<mm/s²>] [TAP_DUR=<s>] [ACCEL=<mm/s²>]` | Adjust tap threshold, tap duration and probing acceleration at runtime and echo the resulting values. Not saved — put the final numbers in the config. |
-| `TEST_TAP_TUNE [X=] [Y=] [Z=] [TEST_TAP_DEVIATION=] [SPEED_START=] [SPEED_END=] [SPEED_STEP=] [THRESSHOLD_START=] [THRESSHOLD_END=] [TRIALS=] [SAMPLES=] [MARGIN=] [WINDOW=] [SAVE=<0\|1>]` | Home if needed, move to the middle of the bed, and find the best `speed` and `tap_thresh` pair. See [Tuning speed and tap_thresh automatically](#tuning-speed-and-tap_thresh-automatically). |
+| `TEST_TAP_TUNE [X=] [Y=] [Z=] [TEST_TAP_DEVIATION=] [SPEED_START=] [SPEED_END=] [SPEED_STEP=] [THRESHOLD_START=] [THRESHOLD_END=] [TRIALS=] [SAMPLES=] [MARGIN=] [WINDOW=] [SAVE=<0\|1>]` | Home if needed, move to the middle of the bed, and find the best `speed` and `tap_thresh` pair. See [Tuning speed and tap_thresh automatically](#tuning-speed-and-tap_thresh-automatically). |
 | `PROBE` | Single probe at the current XY. |
 | `QUERY_PROBE` | Report the current state of the probe pin. Should read `open` with the nozzle in free air. |
 | `PROBE_ACCURACY` | Repeat-probe at the current XY and report the spread. |
@@ -292,8 +292,8 @@ samples at printing temperature with the hotend fan disabled.
 
 `speed` and `tap_thresh` are not independent. A faster probe hits the bed
 harder, so it takes a higher threshold before the move's own acceleration stops
-tripping the tap — and a threshold that works at 2 mm/s may miss the bed
-entirely at 8. `TEST_TAP_TUNE` sweeps the speeds you give it, finds the working
+tripping the tap — and a threshold that works at 10 mm/s may miss the bed
+entirely at 25. `TEST_TAP_TUNE` sweeps the speeds you give it, finds the working
 `tap_thresh` band at each one, and scores the pairs by how repeatable the
 resulting probe actually is.
 
@@ -310,16 +310,16 @@ It refuses to start while a print is running or paused — see
 
 Read this before running it:
 
-- **This takes a while.** The defaults are ten speeds, roughly 300–500 probes,
-  40–80 minutes. The command prints its own estimate before starting. Narrow
-  `SPEED_START`/`SPEED_END` or raise `SPEED_STEP` to cut it down — a first pass
-  with `SPEED_STEP=4` halves it and still shows you which end of the range is
-  worth looking at.
+- **This takes a while.** The defaults are eleven speeds, roughly 275–450
+  probes, 35–70 minutes. The command prints its own estimate before starting.
+  Narrow `SPEED_START`/`SPEED_END` or raise `SPEED_STEP` to cut it down — a
+  first pass with `SPEED_STEP=4` halves it and still shows you which end of the
+  range is worth looking at.
 - **Home first and stand over the machine.** A probe at a threshold that is too
   high does not stop at the bed; the nozzle drives down to `position_min` /
   `minimum_z_position`. The search deliberately starts at the insensitive end,
   which is where that happens. Keep a hand on the emergency stop, and consider
-  a first run with a low `THRESSHOLD_END`.
+  a first run with a low `THRESHOLD_END`.
 - Tune `probe_accel` and `rest_time` **before** running it. The result is only
   valid for the settings in force during the search.
 - Run it over the part of the bed you actually probe. The middle is the usual
@@ -330,9 +330,10 @@ Read this before running it:
   hand first with `SET_ACCEL_PROBE TAP_THRESH=...`, or home once with a Z
   endstop, then run this.
 - The bed gets tapped several hundred times. Use a spot you don't mind marking.
-- The top of the default range is fast for a nozzle tap. If the high speeds
-  come back unusable, that is the answer for your machine, not a fault — the
-  run skips them and carries on.
+- The top of the default range, 30 mm/s, is fast for a nozzle tap. If the high
+  speeds come back unusable, that is the answer for your machine, not a fault —
+  the run skips them and carries on. A machine that wants a gentler probe can
+  sweep below the default floor with `SPEED_START=2`.
 
 ### Parameters
 
@@ -343,11 +344,11 @@ Read this before running it:
 | `Z` | `10` | Height each probe starts its descent from. Must clear anything on the bed. The move to the probing point also happens at this height — on a delta the reachable radius near the top of the travel is nil, so traversing at the height `G28` finishes at is out of range. |
 | `TEST_TAP_DEVIATION` | `0` | Half-width in mm of the square around `X`/`Y` the taps are scattered over. `0` taps the same spot every time. Anything above `0` picks a random point in `X±dev`, `Y±dev` before every probe, so a few hundred taps do not all land in one place. |
 | `TRAVEL_SPEED` | `50` | mm/s for the move to the probing point. Not the probing speed — that is what the command is measuring. |
-| `SPEED_START` | `2` | First probing speed in mm/s. |
-| `SPEED_END` | `20` | Last probing speed in mm/s. |
-| `SPEED_STEP` | `2` | Increment. The defaults test 2, 4, 6, … 20 mm/s — ten speeds. Capped at 20 speeds per run. |
-| `THRESSHOLD_START` | `10000` | Bottom of the `tap_thresh` search range in mm/s². Also accepted as `THRESHOLD_START`. |
-| `THRESSHOLD_END` | `100000` | Top of the `tap_thresh` search range in mm/s². Also accepted as `THRESHOLD_END`. |
+| `SPEED_START` | `10` | First probing speed in mm/s. |
+| `SPEED_END` | `30` | Last probing speed in mm/s. |
+| `SPEED_STEP` | `2` | Increment. The defaults test 10, 12, 14, … 30 mm/s — eleven speeds. Capped at 20 speeds per run. |
+| `THRESHOLD_START` | `10000` | Bottom of the `tap_thresh` search range in mm/s². The misspelling `THRESSHOLD_START` this command shipped with is still accepted. |
+| `THRESHOLD_END` | `100000` | Top of the `tap_thresh` search range in mm/s². The misspelling `THRESSHOLD_END` is still accepted. |
 | `TRIALS` | `3` | Probes per threshold candidate during the band search. A candidate must pass all of them. Raise it if your misfires are intermittent. |
 | `SAMPLES` | `10` | Probes used to score each speed's repeatability, once its threshold is chosen. This is the number the ranking is built on — don't set it below about 5. |
 | `MARGIN` | `2` | Register steps (612.9 mm/s² each) added to the bottom of each band for headroom. `MARGIN=0` uses the bare edge. |
@@ -371,9 +372,9 @@ one of three ways:
 | `sensitive` | Misfired: the tap latched while arming, or fired on the start-of-move acceleration. Threshold too low. |
 | `deaf` | Ran the whole move without triggering. Threshold too high. |
 
-The top of the band is found first — if `THRESSHOLD_END` is `deaf`, by
+The top of the band is found first — if `THRESHOLD_END` is `deaf`, by
 bisecting for the lowest `deaf` value and taking the step below it. Then the
-bottom is bisected between `THRESSHOLD_START` and that top. The running best
+bottom is bisected between `THRESHOLD_START` and that top. The running best
 only ever moves to a value that has been verified passing, so a stray result
 cannot produce a recommendation that was never tested.
 
@@ -474,7 +475,7 @@ Lower `probe_accel` to widen the bands.
 | ------- | ------- |
 | `no speed produced a usable tap_thresh` | No speed had a working band. `probe_accel` is too high, or something is vibrating — a fan (see `disable_fans`), or a stepper. Check the pin with `QUERY_PROBE` first. |
 | `speed N: unusable - tap_thresh M (the top of the range) still misfires` | At this speed even the least sensitive setting misfires. Skipped. |
-| `speed N: unusable - nothing in ... detected the bed` | At this speed nothing in the range felt the contact. Try a lower `THRESSHOLD_START` or a higher speed. |
+| `speed N: unusable - nothing in ... detected the bed` | At this speed nothing in the range felt the contact. Try a lower `THRESHOLD_START` or a higher speed. |
 | `speed N: unusable - M already misfires and P ... misses the bed` | The misfire threshold and the deaf threshold meet with no gap. Lower `probe_accel` to open one up. |
 | `failed the repeatability run` | The chosen threshold passed the trials but not the longer `SAMPLES` run. Results at that speed are marginal; raise `TRIALS` or `MARGIN`. |
 

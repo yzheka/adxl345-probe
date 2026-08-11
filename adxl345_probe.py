@@ -44,10 +44,10 @@ ADXL345_REST_TIME = .1
 TAP_THRESH_MAX = 100000.
 
 # TEST_TAP_TUNE defaults
-TUNE_THRESSHOLD_START = 10000.
-TUNE_THRESSHOLD_END = 100000.
-TUNE_SPEED_START = 2.
-TUNE_SPEED_END = 20.
+TUNE_THRESHOLD_START = 10000.
+TUNE_THRESHOLD_END = 100000.
+TUNE_SPEED_START = 10.
+TUNE_SPEED_END = 30.
 TUNE_SPEED_STEP = 2.
 TUNE_MAX_SPEEDS = 20
 TUNE_TRIALS = 3
@@ -761,15 +761,16 @@ class ADXL345EndstopWrapper:
                 " hundred times, which would wreck the print. Run it when the"
                 " printer is idle. Nothing has been changed." % (busy,))
             return
-        # Both spellings accepted for the threshold range
+        # THRESSHOLD_* is the spelling this command shipped with. Still
+        # accepted so existing macros keep working, but nothing says it.
         lo_thresh = gcmd.get_float(
-            'THRESSHOLD_START',
-            gcmd.get_float('THRESHOLD_START', TUNE_THRESSHOLD_START,
+            'THRESHOLD_START',
+            gcmd.get_float('THRESSHOLD_START', TUNE_THRESHOLD_START,
                            minval=TAP_SCALE, maxval=TAP_THRESH_MAX),
             minval=TAP_SCALE, maxval=TAP_THRESH_MAX)
         hi_thresh = gcmd.get_float(
-            'THRESSHOLD_END',
-            gcmd.get_float('THRESHOLD_END', TUNE_THRESSHOLD_END,
+            'THRESHOLD_END',
+            gcmd.get_float('THRESSHOLD_END', TUNE_THRESHOLD_END,
                            minval=TAP_SCALE, maxval=TAP_THRESH_MAX),
             minval=TAP_SCALE, maxval=TAP_THRESH_MAX)
         speeds = self._tune_speeds(gcmd)
@@ -781,8 +782,8 @@ class ADXL345EndstopWrapper:
         lo = self._tap_code(lo_thresh)
         hi = self._tap_code(hi_thresh)
         if hi <= lo:
-            raise gcmd.error("THRESSHOLD_END must be at least one register"
-                             " step (%.0f mm/s^2) above THRESSHOLD_START"
+            raise gcmd.error("THRESHOLD_END must be at least one register"
+                             " step (%.0f mm/s^2) above THRESHOLD_START"
                              % (TAP_SCALE,))
         start_z = self._move_to_probe_point(gcmd)
         lift_speed = self.param_helper.get_probe_params(gcmd)['lift_speed']

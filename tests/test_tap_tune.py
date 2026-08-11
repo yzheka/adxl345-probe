@@ -421,8 +421,12 @@ def run(name, sensitive_edge, deaf_edge, params, expect_error=None):
     print("  final register: %d  saved: %s  SAVE_CONFIG: %d"
           % (reg, saved, sim.configfile.save_config_calls))
     margin = int(args.get('MARGIN', 2))
-    lo = int(float(args.get('THRESSHOLD_START', 10000.)) / mod.TAP_SCALE)
-    hi = int(float(args.get('THRESSHOLD_END', 100000.)) / mod.TAP_SCALE)
+    lo = int(float(args.get('THRESHOLD_START',
+                            args.get('THRESSHOLD_START', 10000.)))
+             / mod.TAP_SCALE)
+    hi = int(float(args.get('THRESHOLD_END',
+                            args.get('THRESSHOLD_END', 100000.)))
+             / mod.TAP_SCALE)
     want = min(max(sensitive_edge, lo) + margin, min(deaf_edge, hi))
     assert reg == want, "expected reg %d, got %d" % (want, reg)
     if not int(args.get('SAVE', 1)):
@@ -456,6 +460,30 @@ run("whole range misfires", 250, 300, {'SAVE': 0},
     expect_error="no speed produced a usable tap_thresh")
 run("nothing detects the bed", 5, 5, {'SAVE': 0},
     expect_error="no speed produced a usable tap_thresh")
+# THRESSHOLD_* is the spelling the command shipped with. Macros written
+# against it have to keep working.
+run("range given as THRESHOLD_*", 90, 200,
+    {'THRESHOLD_START': 40000, 'THRESHOLD_END': 80000, 'SAVE': 0})
+run("range given as the old THRESSHOLD_*", 90, 200,
+    {'THRESSHOLD_START': 40000, 'THRESSHOLD_END': 80000, 'SAVE': 0})
+
+
+# --- defaults ---------------------------------------------------------------
+
+def default_speeds_case():
+    """The bare command's sweep, straight from the module defaults."""
+    import extras.adxl345_probe as mod
+    wrapper = build(Sim(60, 200), mod)
+    speeds = wrapper._tune_speeds(GCmd({}, [], quiet=True))
+    print("\n=== defaults: speed sweep ===")
+    print("  %s" % (", ".join("%g" % s for s in speeds),))
+    assert speeds[0] == 10., "starts at %g" % speeds[0]
+    assert speeds[-1] == 30., "ends at %g" % speeds[-1]
+    assert len(speeds) == 11, "%d speeds" % len(speeds)
+    print("  -> ok")
+
+
+default_speeds_case()
 
 
 # --- disable_fans -----------------------------------------------------------
