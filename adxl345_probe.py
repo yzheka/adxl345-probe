@@ -76,6 +76,10 @@ CAL_SAMPLES = 10  # taps per accuracy measurement
 # measurement of the bed, so the threshold that produced it is treated as
 # unusable and the walk carries on up.
 CAL_ACCURACY_MAX = 0.1
+# Probe faults in a row before a run gives up. A fault fails its own step and
+# no more, but a machine that faults on every tap is not going to recover by
+# being asked another hundred times.
+CAL_MAX_FAULTS = 3
 # The nozzle rises this far between those taps, and the descent that follows
 # has to be longer than min_probe_travel or the trigger counts as a misfire.
 # Twice that is the default, and this is the floor when it is 0.
@@ -85,10 +89,11 @@ CAL_TRAVEL_SPEED = 50.  # mm/s for the move to the probing point
 CAL_DEVIATION = 20.  # mm of X/Y scatter around the probing point, 0 = off
 CAL_SCATTER_TRIES = 10  # draws before giving up on landing on a round bed
 
-# Probe failures that are a tuning result rather than a fault. Everything
-# else - an SPI readback mismatch, an MCU homing timeout, a shutdown - aborts
-# the search instead of being recorded as "this threshold misfires", which
-# would send the user off tuning a threshold that was never the problem.
+# Probe failures that are a tuning result rather than a fault. Everything else
+# - a latch that would not clear, an SPI readback mismatch, an MCU homing
+# timeout - fails its own step and is reported as itself rather than being
+# recorded as "this threshold misfires", which would send the user off tuning a
+# threshold that was never the problem. A shutdown still stops the run.
 PROBE_DEAF_ERRORS = ('No trigger on',)
 PROBE_SENSITIVE_ERRORS = ('triggered after only',
                           'tap triggered before move',
@@ -543,6 +548,15 @@ class ADXL345EndstopWrapper:
         # the point that was asked for rather than one that cannot be reached.
         return point['x'], point['y']
 
+    # A shutdown is not something the next tap can recover from, so it is the
+    # one fault that still stops a run dead. Older Klipper may not expose the
+    # query; assume it is fine rather than aborting on the check itself.
+    def _is_shutdown(self):
+        try:
+            return bool(self.printer.is_shutdown())
+        except Exception:
+            return False
+
     # One tap, from `from_z`. `scatter` picks a fresh random point within
     # DEVIATION first; without it the tap lands wherever the last one did,
     # which is what an accuracy measurement needs - moving between taps would
@@ -571,11 +585,17 @@ class ADXL345EndstopWrapper:
                 return 'deaf', msg, None
             if any(t in msg for t in PROBE_SENSITIVE_ERRORS):
                 return 'sensitive', msg, None
-            # Anything else is a fault, not a verdict: an SPI readback
-            # mismatch, an MCU homing timeout, a shutdown, a move out of
-            # range. Recording it as a verdict would blame tap_thresh for it.
+            # Anything else is a fault rather than a verdict: a latch that
+            # would not clear, an SPI readback mismatch, an MCU homing
+            # timeout, a move out of range. It says nothing about tap_thresh,
+            # so it is reported as itself and the step is abandoned - the
+            # caller decides whether to carry on or give up.
             self._lift_to(safe_z, lift_speed)
-            raise
+            if self._is_shutdown():
+                # Nothing will work again until the user clears it, so there
+                # is no point walking the rest of the range
+                raise
+            return 'fault', msg, None
         try:
             positions = self.homing_helper.pull_trigger_positions()
         except Exception:
@@ -631,12 +651,30 @@ class ADXL345EndstopWrapper:
                     % (CAL_MAX_SPEEDS,))
         return out
 
+    # A fault fails the step it happened on and nothing more: a latch that
+    # would not clear, or an SPI hiccup, is often gone by the next tap, and
+    # losing a twenty minute run to one of them is worse than losing a rung.
+    # `faults` carries the count across speeds so a machine that faults on
+    # everything still stops rather than grinding through the whole range.
+    def _note_fault(self, gcmd, speed, thresh, detail, faults):
+        faults['run'] += 1
+        faults['total'] += 1
+        faults['last'] = detail
+        gcmd.respond_info(
+            "  speed %5.1f  tap_thresh %6.0f  probe fault, step failed: %s"
+            % (speed, thresh, detail))
+        if faults['run'] >= CAL_MAX_FAULTS:
+            raise gcmd.error(
+                "ADXL_PROBE_CALIBRATE: %d probe faults in a row, so this is"
+                " not a passing glitch - stopping. The last one was: %s"
+                % (faults['run'], detail))
+
     # Walk tap_thresh up until a tap works, then measure how repeatable that
     # tap is. A threshold too low misfires before the effector has descended -
     # one probe, no bed contact - so walking up from the sensitive end is what
     # keeps the bed intact. Returns the accuracy measurement for this speed.
     def _measure_speed(self, gcmd, probe_gcmd, speed, thresholds, samples,
-                       lift, worst, start_z, lift_speed):
+                       lift, worst, faults, start_z, lift_speed):
         probed = []
         for thresh in thresholds:
             if self._tap_code(thresh) <= TAP_GRAVITY_CODE:
@@ -654,6 +692,10 @@ class ADXL345EndstopWrapper:
             # Nothing is logged for the climb itself. A misfire is the expected
             # outcome of a threshold that is still too low, and one line per
             # register step buries the two lines that matter in hundreds.
+            if verdict == 'fault':
+                self._note_fault(gcmd, speed, thresh, detail, faults)
+                continue
+            faults['run'] = 0
             if verdict == 'deaf':
                 # Nothing higher can be more sensitive than this was. If even
                 # the first one probed missed, the fault is upstream of
@@ -700,6 +742,7 @@ class ADXL345EndstopWrapper:
                 if verdict != 'pass':
                     failed = (verdict, detail)
                     break
+                faults['run'] = 0
                 if z is None:
                     continue
                 zs.append(z)
@@ -731,6 +774,9 @@ class ADXL345EndstopWrapper:
             # The accuracy run broke down, so this threshold only works
             # intermittently. Carry on up.
             self._lift_to(start_z, lift_speed)
+            if failed is not None and failed[0] == 'fault':
+                self._note_fault(gcmd, speed, thresh, failed[1], faults)
+                continue
             if failed is not None and failed[0] == 'deaf':
                 raise self.NoThreshold(
                     "tap_thresh %.0f misses the bed part way through the"
@@ -783,6 +829,8 @@ class ADXL345EndstopWrapper:
         base_params['SAMPLES'] = '1'
         keep = False
         measured = []
+        # 'run' is the current unbroken streak, reset by any tap that answers
+        faults = {'run': 0, 'total': 0, 'last': None}
 
         dead = sum(1 for t in thresholds
                    if self._tap_code(t) <= TAP_GRAVITY_CODE)
@@ -805,7 +853,7 @@ class ADXL345EndstopWrapper:
                 try:
                     measured.append(self._measure_speed(
                         gcmd, probe_gcmd, speed, thresholds, samples, lift,
-                        worst, start_z, lift_speed))
+                        worst, faults, start_z, lift_speed))
                 except self.NoThreshold as e:
                     gcmd.respond_info("  speed %5.1f: unusable - %s"
                                       % (speed, e))
@@ -814,7 +862,10 @@ class ADXL345EndstopWrapper:
                     "ADXL_PROBE_CALIBRATE: no speed produced a usable"
                     " tap_thresh. Lower probe_accel, check the wiring with"
                     " QUERY_PROBE, and confirm the probe triggers when you tap"
-                    " the nozzle by hand during a PROBE.")
+                    " the nozzle by hand during a PROBE.%s"
+                    % ("" if not faults['total'] else
+                       " %d step(s) also failed on probe faults, the last"
+                       " being: %s" % (faults['total'], faults['last'])))
             # The pair whose average trigger height sits closest to nominal
             # zero wins - the one that felt the bed with the least travel
             # past it. The spread breaks ties.

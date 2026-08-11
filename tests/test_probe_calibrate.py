@@ -4,8 +4,8 @@
 # printer whose tap detection misfires below one register value and misses the
 # bed above another, with both edges moving as probing speed changes.
 # Verifies that the threshold walk stops at the first setting that taps, that
-# the accuracy measurement picks the best speed, and that faults abort the run
-# rather than being recorded as tuning verdicts.
+# the accuracy measurement picks the best speed, and that a probe fault fails
+# its own step and is reported as itself rather than as a tuning verdict.
 import os
 import shutil
 import sys
@@ -105,7 +105,9 @@ class DescendHelper:
         sim.tested.append((speed, code))
         th = sim.toolhead
         sim.probe_points.append((round(th.pos[0], 6), round(th.pos[1], 6)))
-        if sim.fault is not None and len(sim.tested) >= sim.fault_after:
+        if (sim.fault is not None and len(sim.tested) >= sim.fault_after
+                and (sim.fault_until is None
+                     or len(sim.tested) <= sim.fault_until)):
             raise CommandError(sim.fault)
         sensitive, deaf = sim.band(speed)
         if code < sensitive:
@@ -352,6 +354,8 @@ class Sim:
         self.deep_codes = {}
         self.fault = None
         self.fault_after = 3
+        # last tap that faults; None means it never clears
+        self.fault_until = None
         self.homing_calls = 0
         self.home_result = 'xyz'
         # print_stats / virtual_sdcard are optional in a Klipper config
@@ -805,7 +809,9 @@ walk_property_test(step=5000.)
 # --- error classification ---------------------------------------------------
 
 def classification_case(name, error_text, expect_abort):
-    """A fault must abort the run, not be recorded as a tuning verdict."""
+    """A fault must be reported as itself, not digested into a tuning verdict.
+    The sim faults on every tap from the third onwards, so the run gives up on
+    the fault limit and the real message has to survive into that error."""
     import extras.adxl345_probe as mod
     sim = Sim(60, 200)
     sim.fault = error_text
@@ -844,6 +850,67 @@ classification_case("printer shutdown", "Probing failed due to printer"
 classification_case("move out of range", "Move out of range: 0 0 -422.2", True)
 classification_case("genuine misfire", "ADXL345 probe triggered after only"
                     " 0.000mm of travel (minimum 0.500mm)", False)
+
+
+def transient_fault_case():
+    """A fault fails its own step and nothing more. The one that used to end a
+    run - a latch that would not clear - now costs a rung."""
+    import extras.adxl345_probe as mod
+    sim = Sim(30, 200)
+    sim.fault = ("ADXL345 probe pin reads TRIGGERED while the tap register is"
+                 " clear. Check probe_pin polarity")
+    # taps 2 and 3 fault, everything after works
+    sim.fault_after, sim.fault_until = 2, 3
+    wrapper = build(sim, mod)
+    log = []
+    gcmd = GCmd({'SPEED_START': 5, 'SPEED_END': 5, 'SPEED_STEP': 1,
+                 'SAMPLES': 4, 'DEVIATION': 0}, log, quiet=True)
+    print("\n=== faults: two in a row, then it clears ===")
+    wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
+    failed = [ln for ln in log if 'probe fault, step failed' in ln]
+    for ln in failed:
+        print("  %s" % ln.strip()[:78])
+    assert len(failed) == 2, "%d steps failed, expected 2" % len(failed)
+    # and the run still produced a result
+    assert sim.configfile.saved.get(('adxl345_probe', 'tap_thresh')), \
+        "the run gave up instead of carrying on"
+    print("  -> carried on and finished at reg %d, ok"
+          % sim.chip.regs[0x1D])
+
+
+transient_fault_case()
+
+
+def fault_limit_case():
+    """A machine that faults on everything still stops, and says what the fault
+    was rather than reporting the range as unusable."""
+    import extras.adxl345_probe as mod
+    sim = Sim(30, 200)
+    sim.fault = "Failed to set ADXL345 register [0x1d] to 0x20: got 0x0."
+    sim.fault_after = 1
+    wrapper = build(sim, mod)
+    log = []
+    gcmd = GCmd({'SPEED_START': 5, 'SPEED_END': 5, 'SPEED_STEP': 1,
+                 'SAMPLES': 4, 'DEVIATION': 0}, log, quiet=True)
+    print("\n=== faults: every tap faults ===")
+    try:
+        wrapper.cmd_ADXL_PROBE_CALIBRATE(gcmd)
+    except CommandError as e:
+        print("  ERROR: %s" % e)
+        assert 'faults in a row' in str(e), "unexpected error: %s" % e
+        assert sim.fault in str(e), "the real cause was not reported"
+        # It gave up after the limit rather than walking the whole range
+        assert len(sim.tested) <= mod.CAL_MAX_FAULTS, \
+            "%d taps before giving up" % len(sim.tested)
+        assert sim.chip.regs[0x1D] == wrapper._tap_code(5000.), \
+            "threshold not restored: reg %d" % sim.chip.regs[0x1D]
+        print("  -> stopped after %d taps, threshold restored, ok"
+              % len(sim.tested))
+        return
+    raise AssertionError("a machine that faults on every tap was not stopped")
+
+
+fault_limit_case()
 
 
 # --- multi-speed measurement ------------------------------------------------

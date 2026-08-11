@@ -404,12 +404,25 @@ tap_thresh: 34000
 Run SAVE_CONFIG to keep them - it restarts Klipper.
 ```
 
-Only `pass`, `sensitive` and `deaf` are verdicts. Anything else — an SPI
-readback mismatch, an MCU homing timeout, a printer shutdown, a move out of
-range — aborts the run and reports itself, rather than being recorded as "this
-threshold misfired" and sending you off tuning the wrong thing. An aborted run
-restores the previous `tap_thresh`, lifts back to the height it started from,
-and stages nothing.
+Only `pass`, `sensitive` and `deaf` are verdicts. Anything else — a tap latch
+that would not clear, an SPI readback mismatch, an MCU homing timeout, a move
+out of range — is a **fault**. It says nothing about `tap_thresh`, so it fails
+its own step, is reported as itself rather than as "this threshold misfired",
+and the walk carries on to the next rung:
+
+```
+  speed  24.0  tap_thresh  14711  probe fault, step failed: ADXL345 probe pin reads TRIGGERED while the tap register is clear. ...
+```
+
+Losing a twenty-minute run to one passing glitch is worse than losing a rung.
+But `CAL_MAX_FAULTS` faults **in a row** means it is not a glitch, and the run
+stops and quotes the last one — a machine that faults on every tap will not
+recover by being asked another hundred times. Any tap that answers, however it
+answers, resets that streak. A printer shutdown still stops the run
+immediately, since nothing after it can work.
+
+An aborted run restores the previous `tap_thresh`, lifts back to the height it
+started from, and stages nothing.
 
 ### Parameters
 
@@ -605,6 +618,8 @@ no threshold in the range worked there, the run says so and carries on.
 | `speed N: unusable - tap_thresh M already misses the bed` | The band ended below where the walk reached. Usually means the previous speed's band was much lower. |
 | `speed N: unusable - tap_thresh M misses the bed part way through the accuracy run` | It tapped once, then stopped feeling the bed. Usually a bed that is deflecting under repeated contact. |
 | `only N of M taps worked - raising tap_thresh` | Not a failure: that threshold is marginal, and the walk is carrying on upward. |
+| `probe fault, step failed: ...` | Not fatal: that rung is abandoned and the walk carries on. The quoted message is the real cause. |
+| `N probe faults in a row, so this is not a passing glitch - stopping` | The same fault on `N` consecutive taps. The quoted message is what to fix — a `probe_pin` polarity or pullup problem shows up like this. |
 | `accuracy X is worse than Y - raising tap_thresh` | The taps triggered further than `ACCURACY_MAX` from zero, so they measured deflection rather than the bed. Also not fatal — the walk carries on up. |
 | `LIFT=x is not above min_probe_travel=y` | The accuracy taps would trigger inside `min_probe_travel` and be read as misfires. Leave `LIFT` out and it defaults to twice `min_probe_travel`. |
 
@@ -672,7 +687,7 @@ minimum_z_position: -2
 | ------- | ----- |
 | `AttributeError: module 'extras.probe' has no attribute 'ProbeSessionHelper'` | Module too old for your Klipper — use this fork. See [Klipper compatibility](#klipper-compatibility). |
 | `AttributeError: module 'extras.probe' has no attribute 'ProbeParameterHelper'` | Module too new for your Klipper — use upstream, or update Klipper. |
-| `ADXL345 probe pin reads TRIGGERED while the tap register is clear` | `probe_pin` polarity. Remove a `^` pullup, or add `!` if the interrupt idles high. |
+| `ADXL345 probe pin reads TRIGGERED while the tap register is clear` | `probe_pin` polarity. Remove a `^` pullup, or add `!` if the interrupt idles high. If it happens only occasionally mid-run, the latch simply did not clear in time — raise `rest_time`. `ADXL_PROBE_CALIBRATE` treats it as a failed step and carries on. |
 | `ADXL345 tap triggered before move, it may be set too sensitive.` | The tap latched while arming. Raise `tap_thresh`, raise `rest_time`, or check for fan/motor vibration. |
 | `No trigger on probe after full movement`, at every `tap_thresh` you try | If the values you tried were below 9807, that is the [1 g floor](#the-1-g-floor) — the chip cannot latch a tap there. Otherwise check the pin, `tap_dur`, and that a hand tap stops a `PROBE`. |
 | `ADXL345 probe triggered after only N mm of travel` | False trigger on the start-of-move acceleration. Lower `probe_accel`, then raise `tap_thresh` — or let `ADXL_PROBE_CALIBRATE` find it. |
