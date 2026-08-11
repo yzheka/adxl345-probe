@@ -154,9 +154,38 @@ Make sure to remove `position_endstop` in this case.
 
 | Parameter | Default | Range | Description |
 | --------- | ------- | ----- | ----------- |
-| `tap_thresh` | `5000` | 613 – 100000 | Tap threshold in mm/s². Written to the ADXL345 `THRESH_TAP` register at 62.5 mg/LSB, i.e. **612.9 mm/s² per step** — values between steps are truncated, so 12000 and 12500 both give register value 19. Lower is more sensitive. Too low and the move's own acceleration trips it. |
+| `tap_thresh` | `5000` | 613 – 100000 | Tap threshold in mm/s². Written to the ADXL345 `THRESH_TAP` register at 62.5 mg/LSB, i.e. **612.9 mm/s² per step** — values between steps are truncated, so 12000 and 12500 both give register value 19. Lower is more sensitive, but **only down to 9807** — see [The 1 g floor](#the-1-g-floor). Too low and the move's own acceleration trips it. |
 | `tap_dur` | `0.01` | >0.000625 – 0.1 | Maximum duration in seconds for an event to count as a tap. Written to the `DUR` register at 0.625 ms/LSB, so 0.01 s → 16. Acceleration must rise above `tap_thresh` and fall back below it inside this window; a sustained acceleration is not a tap. |
 | `rest_time` | `0.1` | 0 – 1 | Settle dwell in seconds, applied both before arming and after disarming tap detection. Exists so ringing from the retract move doesn't trip the tap the instant it's armed. Costs 2 × `rest_time` per sample; lower it to speed up multi-sample probing, raise it if you get spurious triggers. |
+
+#### The 1 g floor
+
+**`tap_thresh` below 9807 mm/s² does not work at all**, and it fails in the
+direction nobody expects: the probe stops triggering entirely.
+
+`THRESH_TAP` is compared against *total* acceleration. The ADXL345's tap
+detector is not AC coupled, so the 1 g the effector is already carrying counts
+towards the threshold. A tap is only latched when the acceleration rises above
+the threshold **and falls back below it** inside the `tap_dur` window. Below 1 g
+the threshold is permanently exceeded by the effector just sitting there, the
+fall-back never happens, and no tap is ever registered:
+
+| `tap_thresh` | Register | In g | Result |
+| --- | --- | --- | --- |
+| 1000 | 1 | 0.06 g | `No trigger on probe after full movement` |
+| 5000 | 8 | 0.50 g | `No trigger on probe after full movement` |
+| 9807 | 16 | 1.00 g | exactly 1 g — still no trigger |
+| 10420 | 17 | 1.06 g | lowest setting that can work |
+| 12000 | 19 | 1.19 g | fine |
+
+1 g lands exactly on register 16, so **17 is the lowest usable register**. Note
+the module's own `tap_thresh` default of `5000` is inside the dead zone — it is
+inherited from upstream and has to be raised.
+
+The symptom is the giveaway: a threshold that is too *low* reads as
+`triggered after only 0.000mm of travel` (a misfire) only while it is above the
+floor. Below the floor it reads as no trigger at all, which looks identical to a
+threshold that is far too high.
 
 ### Probing motion
 
@@ -312,8 +341,10 @@ It refuses to start while a print is running or paused — see
 
 For each speed from `SPEED_START` to `SPEED_END`:
 
-**1. Walk `tap_thresh` up.** Starting at `THRESHOLD_START`, tap once. Each
-attempt ends one of three ways:
+**1. Walk `tap_thresh` up.** Starting at `THRESHOLD_START` — which is the
+lowest threshold that can detect a tap at all, see
+[The 1 g floor](#the-1-g-floor) — tap once. Each attempt ends one of three
+ways:
 
 | Result | Meaning | What the nozzle does |
 | ------ | ------- | -------------------- |
@@ -361,7 +392,7 @@ and stages nothing.
 
 | Parameter | Default | Description |
 | --------- | ------- | ----------- |
-| `THRESHOLD_START` | `1000` | First `tap_thresh` tried at every speed, in mm/s². |
+| `THRESHOLD_START` | `10420` | First `tap_thresh` tried at every speed, in mm/s². This is the lowest value that can detect a tap at all (register 17, just above 1 g); a lower request is raised to it with a note saying why — see [The 1 g floor](#the-1-g-floor). |
 | `THRESHOLD_END` | `100000` | Highest `tap_thresh` the walk will reach before giving up on a speed. |
 | `THRESHOLD_STEP` | `1000` | How much `tap_thresh` rises after a misfire, in mm/s². The chip stores the threshold at **612.9 mm/s² per register step**, so values that land on a register already tried are skipped rather than re-probed. |
 | `SPEED_START` | `10` | First probing speed in mm/s. |
@@ -379,8 +410,8 @@ and stages nothing.
 ### Read this before running it
 
 - **This takes a while.** The defaults are eleven speeds, each walking up from
-  1000 mm/s², so roughly 700 probes for a machine whose threshold lands near
-  34000 — about 30 minutes. Only about a tenth of them touch the bed. Raise
+  the 1 g floor, so roughly 450 probes for a machine whose threshold lands near
+  34000 — about 20 minutes. Only about a tenth of them touch the bed. Raise
   `THRESHOLD_START` to skip the part of the climb you already know misfires,
   which is the biggest saving available.
 - **Stand over the machine for the first run.** A probe at a threshold that is
@@ -462,7 +493,8 @@ the run says so and carries on.
 | ------- | ------- |
 | `no speed produced a usable tap_thresh` | No speed worked at all. `probe_accel` is too high, or something is vibrating — a fan (see `disable_fans`), or a stepper. Check the pin with `QUERY_PROBE` first. |
 | `speed N: unusable - every tap_thresh from A to B misfired` | Even the least sensitive setting in the range misfires at this speed. Raise `THRESHOLD_END`, or lower `probe_accel`. |
-| `speed N: unusable - tap_thresh M already misses the bed` | The first threshold tried was already too insensitive to feel the contact, so nothing above it can work either. Lower `THRESHOLD_START`. |
+| `speed N: unusable - the most sensitive usable tap_thresh (M) did not feel the bed at all` | Not a threshold problem: nothing above M can be more sensitive. Check the pin with `QUERY_PROBE`, check `tap_dur` is long enough for the contact, and confirm a hand tap on the nozzle stops a `PROBE`. |
+| `speed N: unusable - tap_thresh M already misses the bed` | The band ended below where the walk reached. Usually means the previous speed's band was much lower. |
 | `speed N: unusable - tap_thresh M misses the bed part way through the accuracy run` | It tapped once, then stopped feeling the bed. Usually a bed that is deflecting under repeated contact. |
 | `only N of M taps worked (...) - raising tap_thresh` | Not a failure: that threshold is marginal, and the walk is carrying on upward. |
 | `LIFT=x is not above min_probe_travel=y` | The accuracy taps would trigger inside `min_probe_travel` and be read as misfires. Raise `LIFT` above it. |
@@ -533,6 +565,7 @@ minimum_z_position: -2
 | `AttributeError: module 'extras.probe' has no attribute 'ProbeParameterHelper'` | Module too new for your Klipper — use upstream, or update Klipper. |
 | `ADXL345 probe pin reads TRIGGERED while the tap register is clear` | `probe_pin` polarity. Remove a `^` pullup, or add `!` if the interrupt idles high. |
 | `ADXL345 tap triggered before move, it may be set too sensitive.` | The tap latched while arming. Raise `tap_thresh`, raise `rest_time`, or check for fan/motor vibration. |
+| `No trigger on probe after full movement`, at every `tap_thresh` you try | If the values you tried were below 9807, that is the [1 g floor](#the-1-g-floor) — the chip cannot latch a tap there. Otherwise check the pin, `tap_dur`, and that a hand tap stops a `PROBE`. |
 | `ADXL345 probe triggered after only N mm of travel` | False trigger on the start-of-move acceleration. Lower `probe_accel`, then raise `tap_thresh` — or let `ADXL_PROBE_CALIBRATE` find it. |
 | `ADXL_PROBE_CALIBRATE: G28 did not home X, Y and Z` | The command homed for you, but an axis is still unhomed afterwards. Usually a failed Z home — fix that first. |
 | `the kinematics do not report a travel range` | The middle of the bed cannot be worked out for this kinematics. Pass `X=` and `Y=` explicitly. |

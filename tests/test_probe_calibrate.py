@@ -400,11 +400,14 @@ SINGLE_SPEED = {'SPEED_START': 5, 'SPEED_END': 5, 'SPEED_STEP': 1,
                 'SAMPLES': 4, 'DEVIATION': 0}
 
 
-def walk_lands_on(wrapper, sensitive, deaf, lo=1000., hi=100000., step=1000.):
+def walk_lands_on(wrapper, sensitive, deaf, lo=None, hi=100000., step=1000.):
     """The threshold the walk has to stop at: the first one it tries whose
     register is at or above the misfire edge. None if that one already misses
-    the bed, which is the whole band gone."""
-    thresh = lo
+    the bed, which is the whole band gone. The walk never starts below the 1g
+    floor, whatever it is asked for."""
+    import extras.adxl345_probe as mod
+    floor = wrapper._code_thresh(mod.TAP_FLOOR_CODE)
+    thresh = floor if lo is None or lo < floor else lo
     while thresh <= hi + 1e-9:
         code = wrapper._tap_code(thresh)
         if code >= sensitive:
@@ -442,7 +445,7 @@ def run(name, sensitive_edge, deaf_edge, params, expect_error=None):
     assert expect_error is None, "expected error %r, got success" % expect_error
     want = walk_lands_on(
         wrapper, sensitive_edge, deaf_edge,
-        float(args.get('THRESHOLD_START', 1000.)),
+        args.get('THRESHOLD_START') and float(args['THRESHOLD_START']),
         float(args.get('THRESHOLD_END', 100000.)),
         float(args.get('THRESHOLD_STEP', 1000.)))
     assert want is not None, "the case itself expects no usable threshold"
@@ -472,10 +475,19 @@ probe_stub.ProbeCommandHelper = object
 probe_stub.HomingViaProbeHelper = object
 
 run("first threshold already taps", 1, 200, {})
-run("misfire edge just above the start", 3, 200, {})
+run("misfire edge just above the floor", 18, 200, {})
 run("misfire edge mid range", 90, 200, {})
 run("misfire edge near the end", 160, 200, {})
-run("narrow band, one register wide", 60, 60, {})
+# A one-register band is only found if the ladder happens to land on it: a
+# 1000 mm/s^2 step advances the register by one or two, so it can step over one
+run("narrow band the ladder lands on", 61, 61, {})
+run("narrow band the ladder steps over", 60, 60, {},
+    expect_error="no speed produced a usable tap_thresh")
+run("...and a 613 step finds it", 60, 60, {'THRESHOLD_STEP': 613})
+# Below 1g the chip can never latch a tap, so the walk starts above it however
+# low it is asked to start
+run("a start below 1g is raised to the floor", 90, 200,
+    {'THRESHOLD_START': 1000})
 run("coarser threshold step", 90, 200, {'THRESHOLD_STEP': 5000})
 run("range given explicitly", 90, 200,
     {'THRESHOLD_START': 40000, 'THRESHOLD_END': 80000})
@@ -502,10 +514,14 @@ def defaults_case():
              len(thresholds)))
     assert (speeds[0], speeds[-1], len(speeds)) == (10., 30., 11), \
         "speeds %s" % (speeds,)
-    assert thresholds[0] == 1000., "starts at %g" % thresholds[0]
+    assert wrapper._tap_code(thresholds[0]) == mod.TAP_FLOOR_CODE, \
+        "starts at %g, register %d - the 1g floor is register %d" \
+        % (thresholds[0], wrapper._tap_code(thresholds[0]),
+           mod.TAP_FLOOR_CODE)
     assert thresholds[-1] <= 100000., "ends at %g" % thresholds[-1]
     assert thresholds[1] - thresholds[0] == 1000., "step is not 1000"
-    assert wrapper._tap_code(1000.) == 1, "1000 mm/s^2 is not register 1"
+    assert mod.TAP_GRAVITY_CODE == 16, \
+        "1g is register %d, expected 16" % mod.TAP_GRAVITY_CODE
     print("  -> ok")
 
 
@@ -515,10 +531,10 @@ def dedupe_case():
     import extras.adxl345_probe as mod
     wrapper = build(Sim(60, 200), mod)
     thresholds = wrapper._thresholds(
-        GCmd({'THRESHOLD_START': 1000, 'THRESHOLD_END': 4000,
+        GCmd({'THRESHOLD_START': 11000, 'THRESHOLD_END': 14000,
               'THRESHOLD_STEP': 100}, [], quiet=True))
     codes = [wrapper._tap_code(t) for t in thresholds]
-    print("\n=== threshold ladder: 100 mm/s^2 step over 1000-4000 ===")
+    print("\n=== threshold ladder: 100 mm/s^2 step over 11000-14000 ===")
     print("  %d thresholds, registers %s" % (len(thresholds), codes))
     assert len(codes) == len(set(codes)), "the same register is probed twice"
     print("  -> ok")
@@ -862,13 +878,13 @@ def restart_case():
     for ln in log:
         if 'taps, range' in ln:
             print("  %s" % ln.strip())
-    # Both walks start at reg 1 (1000 mm/s^2), whatever the previous speed did
+    # Both walks start at the 1g floor, whatever the previous speed did
     for speed in (2.0, 4.0):
         first = [c for sp, c in sim.tested if sp == speed][0]
-        assert first == wrapper._tap_code(1000.), \
+        assert first == mod.TAP_FLOOR_CODE, \
             "%g mm/s started at reg %d" % (speed, first)
     # 4 mm/s is both more accurate and lower in the range
-    assert sim.chip.regs[0x1D] == 21, "reg %d" % sim.chip.regs[0x1D]
+    assert sim.chip.regs[0x1D] == 20, "reg %d" % sim.chip.regs[0x1D]
     assert float(sim.configfile.saved[('adxl345_probe', 'speed')]) == 4.
     print("  -> both walks restarted at 1000 mm/s^2, ok")
 
@@ -933,9 +949,9 @@ def intermittent_case():
     not good enough: the walk carries on up instead of failing the speed."""
     import extras.adxl345_probe as mod
     sim = Sim(28, 200)
-    # The first rung of the 1000 mm/s^2 ladder at or above the misfire edge is
-    # 18000 mm/s^2, register 29. Make that one work once and then misfire.
-    sim.flaky_code = 29
+    # The first rung of the ladder at or above the misfire edge is 17420
+    # mm/s^2, register 28. Make that one work once and then misfire.
+    sim.flaky_code = 28
     wrapper = build(sim, mod)
     log = []
     gcmd = GCmd({'SPEED_START': 5, 'SPEED_END': 5, 'SPEED_STEP': 1,

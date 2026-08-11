@@ -45,8 +45,20 @@ ADXL345_REST_TIME = .1
 # configured value to 100000 mm/s**2 (register 163) - keep one constant for it
 TAP_THRESH_MAX = 100000.
 
+# THRESH_TAP is compared against total acceleration, gravity included - the
+# ADXL345's tap detector is not AC coupled. A tap is only latched when the
+# acceleration rises above the threshold and falls back below it inside the DUR
+# window, so a threshold at or below 1g is permanently exceeded by the effector
+# just sitting there and no tap can ever be registered: the probe reads as
+# "no trigger", not as "too sensitive". 1g lands exactly on register 16
+# (0.0625g per step), making 17 the lowest usable setting.
+TAP_GRAVITY_CODE = int(adxl345.FREEFALL_ACCEL / TAP_SCALE)
+TAP_FLOOR_CODE = TAP_GRAVITY_CODE + 1
+
 # ADXL_PROBE_CALIBRATE defaults
-CAL_THRESHOLD_START = 1000.
+# The lowest threshold that can latch a tap at all - one register above 1g.
+# Anything lower is not "very sensitive", it is deaf.
+CAL_THRESHOLD_START = math.ceil(TAP_FLOOR_CODE * TAP_SCALE)
 CAL_THRESHOLD_END = 100000.
 CAL_THRESHOLD_STEP = 1000.  # mm/s**2 added after a misfire
 CAL_SPEED_START = 10.
@@ -557,10 +569,11 @@ class ADXL345EndstopWrapper:
         return 'pass', ("triggered at z %.4f" % (z,) if z is not None
                         else "triggered, no position reported"), z
 
-    # The sequence of thresholds tried at each speed, in mm/s**2. Values that
-    # land on a THRESH_TAP register already tried are dropped: the register is
-    # 612.9 mm/s**2 per step, so a step finer than that would re-probe the
-    # same setting.
+    # The sequence of thresholds tried at each speed, in mm/s**2. Two things
+    # are dropped: anything at or below 1g, which cannot latch a tap at all
+    # (see TAP_FLOOR_CODE), and values landing on a THRESH_TAP register already
+    # tried, since the register is 612.9 mm/s**2 per step and a finer step
+    # would re-probe the same setting.
     def _thresholds(self, gcmd):
         lo = gcmd.get_float('THRESHOLD_START', CAL_THRESHOLD_START,
                             minval=TAP_SCALE, maxval=TAP_THRESH_MAX)
@@ -569,6 +582,22 @@ class ADXL345EndstopWrapper:
         step = gcmd.get_float('THRESHOLD_STEP', CAL_THRESHOLD_STEP, above=0.)
         if hi < lo:
             raise gcmd.error("THRESHOLD_END must not be below THRESHOLD_START")
+        floor = self._code_thresh(TAP_FLOOR_CODE)
+        if lo < floor:
+            gcmd.respond_info(
+                "ADXL_PROBE_CALIBRATE: starting at %.0f mm/s^2, not %.0f -"
+                " THRESH_TAP includes the 1g the effector already carries, so"
+                " anything at or below %.0f is permanently exceeded and no tap"
+                " is ever latched. Register %d is the lowest that can work."
+                % (floor, lo, self._code_thresh(TAP_GRAVITY_CODE),
+                   TAP_FLOOR_CODE))
+            lo = floor
+        if hi < floor:
+            raise gcmd.error(
+                "ADXL_PROBE_CALIBRATE: THRESHOLD_END=%.0f is at or below the"
+                " 1g the effector carries (%.0f mm/s^2), where tap detection"
+                " can never latch. Raise it above %.0f."
+                % (hi, self._code_thresh(TAP_GRAVITY_CODE), floor))
         out, seen, thresh = [], set(), lo
         while thresh <= hi + 1e-9:
             code = self._tap_code(thresh)
@@ -611,7 +640,17 @@ class ADXL345EndstopWrapper:
                 "  speed %5.1f  tap_thresh %6.0f (reg %3d): %-9s %s"
                 % (speed, thresh, self._tap_code(thresh), verdict, detail))
             if verdict == 'deaf':
-                # Nothing higher can be more sensitive than this was
+                # Nothing higher can be more sensitive than this was. If even
+                # the first threshold missed, the fault is upstream of
+                # tap_thresh - say so rather than blaming the range.
+                if thresh == thresholds[0]:
+                    raise self.NoThreshold(
+                        "the most sensitive usable tap_thresh (%.0f) did not"
+                        " feel the bed at all. That is not a threshold"
+                        " problem: check the wiring with QUERY_PROBE, check"
+                        " that tap_dur (%.4f s) is long enough for the"
+                        " contact, and confirm a hand tap on the nozzle stops"
+                        " a PROBE" % (thresh, self.tap_dur))
                 raise self.NoThreshold(
                     "tap_thresh %.0f already misses the bed" % (thresh,))
             if verdict == 'sensitive':
