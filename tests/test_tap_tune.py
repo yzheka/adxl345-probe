@@ -360,10 +360,14 @@ class Sim:
         return self.bands.get(speed, (self.sensitive_edge, self.deaf_edge))
 
     def jitter(self, speed):
-        amplitude = self.noise.get(speed, 0.)
+        noise = self.noise.get(speed, 0.)
         self.noise_step += 1
+        if isinstance(noise, (list, tuple)):
+            # Explicit offsets, cycled. Lets two speeds share a spread while
+            # differing in sigma, which is what breaks a tie.
+            return noise[self.noise_step % len(noise)]
         # deterministic triangle: hits +/- amplitude/2 across any 4 samples
-        return amplitude * ((self.noise_step % 4) - 1.5) / 3.
+        return noise * ((self.noise_step % 4) - 1.5) / 3.
 
 
 def build(sim, mod, extra_config=None):
@@ -782,9 +786,15 @@ DRIFT = {2.0: (20, 40), 4.0: (26, 50), 6.0: (34, 62), 8.0: (44, 78)}
 speed_case("repeatability picks the winner", DRIFT,
            {2.0: 0.020, 4.0: 0.004, 6.0: 0.012, 8.0: 0.030}, 4.0, 28)
 
-# Same bands, but two speeds tie on repeatability: the wider band wins
-speed_case("band width breaks the tie", DRIFT,
-           {2.0: 0.020, 4.0: 0.010, 6.0: 0.010, 8.0: 0.030}, 6.0, 36)
+# Same bands, but two speeds tie on spread - both scatter over 0.010. The
+# lower sigma breaks it: 6 mm/s clusters around the middle, 4 mm/s sits at the
+# two extremes. Both offset cycles are 4 long and SAMPLES is 4, so every
+# scoring run sees one whole cycle whatever the phase.
+speed_case("sigma breaks a tie on spread", DRIFT,
+           {2.0: 0.020,
+            4.0: (-0.005, 0.005, -0.005, 0.005),
+            6.0: (-0.005, 0.0, 0.005, 0.0),
+            8.0: 0.030}, 6.0, 36)
 
 # One speed has no usable band at all - it is skipped, not fatal
 speed_case("a speed with no usable band is skipped",
@@ -799,8 +809,9 @@ speed_case("no speed works",
 
 
 def window_case():
-    """The carried-over window must not truncate the reported band: a band
-    that drifts far between speeds has to be re-found, not clipped."""
+    """The carried-over floor must not hide a band that moved: the walk starts
+    just below the previous speed's edge, and a band that drifted far above it
+    still has to be found in full."""
     import extras.adxl345_probe as mod
     bands = {2.0: (20, 40), 4.0: (120, 150)}
     sim = Sim(60, 200, bands=bands, noise={2.0: 0.02, 4.0: 0.01})
@@ -808,16 +819,19 @@ def window_case():
     log = []
     gcmd = GCmd({'SPEED_START': 2, 'SPEED_END': 4, 'SPEED_STEP': 2,
                  'SAMPLES': 4, 'SAVE': 0, 'WINDOW': 4}, log, quiet=True)
-    print("\n=== speeds: band jumps outside the carried window ===")
+    print("\n=== speeds: band moves far above the carried floor ===")
     wrapper.cmd_TEST_TAP_TUNE(gcmd)
-    lines = [ln for ln in log if 'band reg' in ln]
+    lines = [ln for ln in log if 'works from reg' in ln]
     for ln in lines:
         print("  %s" % ln.strip())
-    assert any('band reg 20-40' in ln for ln in lines), "2 mm/s band wrong"
-    assert any('band reg 120-150' in ln for ln in lines), \
-        "4 mm/s band was clipped to the carried window"
+    assert any('works from reg 20,' in ln for ln in lines), "2 mm/s edge wrong"
+    assert any('works from reg 120,' in ln for ln in lines), \
+        "4 mm/s edge not found above the carried floor"
     assert sim.chip.regs[0x1D] == 122, "reg %d" % sim.chip.regs[0x1D]
-    print("  -> both bands found in full, ok")
+    # The 4 mm/s walk starts at 20 - WINDOW, not at the bottom of the range
+    starts = sorted(c for sp, c in sim.tested if sp == 4.0)
+    assert starts[0] == 16, "4 mm/s walk started at reg %d" % starts[0]
+    print("  -> both edges found, walk started from the carried floor, ok")
 
 
 window_case()

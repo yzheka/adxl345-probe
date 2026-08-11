@@ -200,7 +200,7 @@ Standard Klipper probe parameters, handled by `probe.ProbeParameterHelper`.
 | Command | Description |
 | ------- | ----------- |
 | `SET_ACCEL_PROBE [TAP_THRESH=<mm/s²>] [TAP_DUR=<s>] [ACCEL=<mm/s²>]` | Adjust tap threshold, tap duration and probing acceleration at runtime and echo the resulting values. Not saved — put the final numbers in the config. |
-| `TEST_TAP_TUNE [X=] [Y=] [Z=] [TEST_TAP_DEVIATION=] [SPEED_START=] [SPEED_END=] [SPEED_STEP=] [THRESHOLD_START=] [THRESHOLD_END=] [TRIALS=] [SAMPLES=] [MARGIN=] [WINDOW=] [SAVE=<0\|1>]` | Home if needed, move to the middle of the bed, and find the best `speed` and `tap_thresh` pair. See [Tuning speed and tap_thresh automatically](#tuning-speed-and-tap_thresh-automatically). |
+| `TEST_TAP_TUNE [X=] [Y=] [Z=] [TEST_TAP_DEVIATION=] [SPEED_START=] [SPEED_END=] [SPEED_STEP=] [THRESHOLD_START=] [THRESHOLD_END=] [THRESHOLD_STEP=] [TRIALS=] [SAMPLES=] [MARGIN=] [WINDOW=] [SAVE=<0\|1>]` | Home if needed, move to the middle of the bed, and find the best `speed` and `tap_thresh` pair. See [Tuning speed and tap_thresh automatically](#tuning-speed-and-tap_thresh-automatically). |
 | `PROBE` | Single probe at the current XY. |
 | `QUERY_PROBE` | Report the current state of the probe pin. Should read `open` with the nozzle in free air. |
 | `PROBE_ACCURACY` | Repeat-probe at the current XY and report the spread. |
@@ -310,16 +310,20 @@ It refuses to start while a print is running or paused — see
 
 Read this before running it:
 
-- **This takes a while.** The defaults are eleven speeds, roughly 275–450
-  probes, 35–70 minutes. The command prints its own estimate before starting.
+- **This takes a while.** The defaults are eleven speeds, roughly 200–550
+  probes, 30–70 minutes. Most of them are misfires that never touch the bed —
+  see [Sparing the bed](#sparing-the-bed). The command prints its own estimate
+  before starting.
   Narrow `SPEED_START`/`SPEED_END` or raise `SPEED_STEP` to cut it down — a
   first pass with `SPEED_STEP=4` halves it and still shows you which end of the
   range is worth looking at.
-- **Home first and stand over the machine.** A probe at a threshold that is too
-  high does not stop at the bed; the nozzle drives down to `position_min` /
-  `minimum_z_position`. The search deliberately starts at the insensitive end,
-  which is where that happens. Keep a hand on the emergency stop, and consider
-  a first run with a low `THRESHOLD_END`.
+- **Stand over the machine anyway.** A probe at a threshold that is too high
+  does not stop at the bed; the nozzle drives down to `position_min` /
+  `minimum_z_position`. The search is built to avoid that — it starts at the
+  sensitive end, where a wrong threshold misfires without the nozzle ever
+  reaching the bed, and it never hunts for the top of the band — but a machine
+  whose band is narrower than `MARGIN` will still produce one. Keep a hand on
+  the emergency stop for the first run.
 - Tune `probe_accel` and `rest_time` **before** running it. The result is only
   valid for the settings in force during the search.
 - Run it over the part of the bed you actually probe. The middle is the usual
@@ -349,10 +353,11 @@ Read this before running it:
 | `SPEED_STEP` | `2` | Increment. The defaults test 10, 12, 14, … 30 mm/s — eleven speeds. Capped at 20 speeds per run. |
 | `THRESHOLD_START` | `10000` | Bottom of the `tap_thresh` search range in mm/s². The misspelling `THRESSHOLD_START` this command shipped with is still accepted. |
 | `THRESHOLD_END` | `100000` | Top of the `tap_thresh` search range in mm/s². The misspelling `THRESSHOLD_END` is still accepted. |
+| `THRESHOLD_STEP` | `1` | How much the walk raises `tap_thresh` after a misfire, in register steps (612.9 mm/s² each, like `MARGIN` and `WINDOW`). `1` tries every register and cannot miss a band. A bigger step gets to the band in fewer probes; if it lands past a narrow band, the registers it skipped are re-walked one at a time. |
 | `TRIALS` | `3` | Probes per threshold candidate during the band search. A candidate must pass all of them. Raise it if your misfires are intermittent. |
 | `SAMPLES` | `10` | Probes used to score each speed's repeatability, once its threshold is chosen. This is the number the ranking is built on — don't set it below about 5. |
-| `MARGIN` | `2` | Register steps (612.9 mm/s² each) added to the bottom of each band for headroom. `MARGIN=0` uses the bare edge. |
-| `WINDOW` | `16` | Register steps searched either side of the previous speed's band before falling back to the full range. `WINDOW=255` disables the narrowing. |
+| `MARGIN` | `2` | Register steps (612.9 mm/s² each) of headroom above the edge, each one verified by probing. The candidate is the highest of them that still passes, so `MARGIN` is a ceiling, not an assumption. `MARGIN=0` uses the bare edge and probes nothing extra. |
+| `WINDOW` | `16` | Register steps below the previous speed's edge where the next speed starts walking, instead of at `THRESHOLD_START`. This is what keeps the run from re-walking the whole range at every speed. `WINDOW=255` effectively disables the shortcut. |
 | `SAVE` | `1` | `1` writes `speed` and `tap_thresh` to the config and runs `SAVE_CONFIG`, which **restarts Klipper**. `0` applies them for this session and writes nothing — the lines to paste are printed either way. |
 | `CHIP` | — | Accelerometer name, matching `chip:`. Optional; only useful if you have named your `[adxl345]` section. |
 
@@ -360,39 +365,46 @@ Read this before running it:
 
 For each speed in turn:
 
-**1. Find the band.** The chip stores the threshold in an 8-bit register at
-612.9 mm/s² per step, so the search runs over register steps rather than raw
-mm/s² — the default range is 147 of them. Both ends of the working band are
-found by bisection, about 8–9 candidates instead of 147. Each candidate ends
-one of three ways:
+**1. Walk up to the band.** The chip stores the threshold in an 8-bit register
+at 612.9 mm/s² per step, so the search runs over register steps rather than raw
+mm/s² — the default range is 147 of them. Starting at `THRESHOLD_START`, it
+probes, and while the probe misfires it raises `tap_thresh` by `THRESHOLD_STEP`
+registers and probes again. Each attempt ends one of three ways:
 
-| Result | Meaning |
-| ------ | ------- |
-| `pass` | Descended past `min_probe_travel` and triggered. |
-| `sensitive` | Misfired: the tap latched while arming, or fired on the start-of-move acceleration. Threshold too low. |
-| `deaf` | Ran the whole move without triggering. Threshold too high. |
+| Result | Meaning | What the nozzle does |
+| ------ | ------- | -------------------- |
+| `sensitive` | Misfired: the tap latched while arming, or fired on the start-of-move acceleration. Threshold too low. | Stops in the first fraction of a millimetre — **never reaches the bed** |
+| `pass` | Descended past `min_probe_travel` and triggered. | A normal tap |
+| `deaf` | Ran the whole move without triggering. Threshold too high. | **Drives into the bed** and keeps pushing to the descent floor |
 
-The top of the band is found first — if `THRESHOLD_END` is `deaf`, by
-bisecting for the lowest `deaf` value and taking the step below it. Then the
-bottom is bisected between `THRESHOLD_START` and that top. The running best
-only ever moves to a value that has been verified passing, so a stray result
-cannot produce a recommendation that was never tested.
+The walk stops at the first `pass`, which is the bottom of the working band.
+Everything below it cost one misfire each and never touched the bed.
 
-**2. Score it.** The candidate is the bottom of the band plus `MARGIN` steps,
-capped at the top of the band. `SAMPLES` probes run at that value and the Z
-spread is recorded, the same measurement `PROBE_ACCURACY` reports.
+**2. Verify the margin.** From that edge the search steps up one register at a
+time, up to `MARGIN` steps, stopping at the last value that still passes. That
+value is the candidate.
 
-**3. Carry the window.** The next speed searches `WINDOW` register steps either
-side of this band rather than the whole range — the band moves with speed, but
-not usually far. If the band turns out to touch the edge of that window, or
-isn't in it at all, the search widens back out, so the narrowing costs accuracy
-nowhere; it only saves probes when the guess was good.
+The top of the band is deliberately **not** measured. Finding it means probing
+until the bed is missed, and every `deaf` attempt drives the nozzle into the
+bed for the whole descent — which is the one thing worth avoiding. The
+consequence is that the reported headroom is "verified this far", not "the band
+ends here".
+
+**3. Score it.** `SAMPLES` probes run at the candidate and the Z spread is
+recorded, the same measurement `PROBE_ACCURACY` reports.
+
+**4. Carry the floor.** The next speed starts its walk `WINDOW` registers below
+this speed's edge rather than at the bottom of the range — the band moves with
+speed, but not usually far, and the walk is where nearly all the probes go. If
+that floor turns out to be above the band, or the edge is found at the floor
+itself, the walk restarts from `THRESHOLD_START`, so the shortcut costs
+accuracy nowhere.
 
 A speed with no usable band at all is reported and skipped, not treated as
 fatal. The run only fails if *no* speed works.
 
-Finally the pairs are ranked by Z spread, ties broken by the wider band — the
-pair with the most room before it starts misfiring. The winner's `speed` and
+Finally the pairs are ranked by Z spread, ties broken by the lower sigma, since
+the spread is only the two extreme samples. The winner's `speed` and
 `tap_thresh` are applied, and saved if `SAVE=1`. The value written for
 `tap_thresh` is the smallest whole mm/s² that maps back onto the winning
 register, so what is written reproduces exactly what was tested.
@@ -402,16 +414,31 @@ readback mismatch, an MCU homing timeout, a printer shutdown, a move out of
 range — aborts the run and reports itself, rather than being recorded as "this
 threshold misfires" and sending you off tuning the wrong thing.
 
-Bisection assumes misfiring is monotonic in the threshold, which tap detection
+The walk assumes misfiring is monotonic in the threshold, which tap detection
 only roughly is. Confirm the winner with `PROBE_ACCURACY` before trusting it.
 
 ### Sparing the bed
 
-A full run is a few hundred nozzle taps, and by default every one of them lands
-on the same square millimetre. On a smooth PEI or a glass bed that eventually
-shows. `TEST_TAP_DEVIATION` spreads them out: with `TEST_TAP_DEVIATION=5` each
-probe first moves to a random point within 5 mm of `X`/`Y` in both axes, at
-`TRAVEL_SPEED`, then descends.
+Two things protect the bed, and they are independent.
+
+**The search direction.** Walking up from the sensitive end means a wrong
+threshold misfires in the first fraction of a millimetre instead of pressing the
+nozzle into the bed, and not measuring the top of the band means never
+deliberately probing until the bed is missed. On a simulated eleven-speed run
+whose band drifts with speed:
+
+| | Total probes | Misfires (no contact) | Taps | Drove into the bed |
+| --- | --- | --- | --- | --- |
+| Bisecting from `THRESHOLD_END` down | 385 | 26 | 341 | 18 |
+| Walking up from `THRESHOLD_START` | 478 | 269 | 209 | 0 |
+
+More probes, but 209 taps instead of 341 and nothing driven into the bed. The
+extra probes are misfires, which cost a second each and never make contact.
+
+**The spot.** The taps that do land still land in the same place by default, and
+on smooth PEI or glass that eventually shows. `TEST_TAP_DEVIATION` spreads them
+out: with `TEST_TAP_DEVIATION=5` each probe first moves to a random point within
+5 mm of `X`/`Y` in both axes, at `TRAVEL_SPEED`, then descends.
 
 ```
 TEST_TAP_TUNE TEST_TAP_DEVIATION=5
@@ -458,16 +485,28 @@ Klipper, and the check will not catch it.
 ### Reading the output
 
 ```
-  speed   4.0  tap_thresh  17162 (reg  28): band reg 26-50 (24 steps), 10 samples, range 0.0042 sigma 0.0015
+  speed  10.0  tap_thresh   9807 (reg  16): sensitive Probe triggered prior to movement
+  speed  10.0  tap_thresh  10420 (reg  17): sensitive Probe triggered prior to movement
+  ... one line per register step ...
+  speed  10.0  tap_thresh  16549 (reg  27): sensitive Probe triggered prior to movement
+  speed  10.0  tap_thresh  17162 (reg  28): pass      z min 0.0193 max 0.0220 range 0.0027
+  speed  10.0  tap_thresh  17775 (reg  29): pass      z min 0.0180 max 0.0207 range 0.0027
+  speed  10.0  tap_thresh  18388 (reg  30): pass      z min 0.0180 max 0.0220 range 0.0040
+  speed  10.0  tap_thresh  18388 (reg  30): works from reg 28, +2 of 2 headroom, 10 samples, range 0.0040 sigma 0.0015
 TEST_TAP_TUNE: results, best first
-  1. speed   4.0  tap_thresh  17162  range 0.0042  sigma 0.0015  band 24 steps
-  2. speed   6.0  tap_thresh  22065  range 0.0121  sigma 0.0044  band 28 steps
+  1. speed  10.0  tap_thresh  18388  range 0.0040  sigma 0.0015  works from reg 28
+  2. speed  12.0  tap_thresh  22065  range 0.0120  sigma 0.0041  works from reg 34
 ```
 
-A wide band means the setup has room to spare at that speed. A narrow one — a
-handful of register steps — means it is close to having no working threshold at
-all, and small changes (a different bed spot, a warmer chamber) may break it.
-Lower `probe_accel` to widen the bands.
+The `sensitive` lines are the walk climbing towards the band — each one is a
+probe that misfired without touching the bed. `works from reg N` is the lowest
+register that passed, and `+2 of 2 headroom` means both margin steps above it
+were probed and also passed.
+
+Headroom below the `MARGIN` asked for is the interesting case: it means the band
+ran out, so the setup is close to having no working threshold at that speed, and
+small changes (a different bed spot, a warmer chamber) may break it. Lower
+`probe_accel` to widen the bands.
 
 ### Failure messages
 
@@ -476,8 +515,8 @@ Lower `probe_accel` to widen the bands.
 | `no speed produced a usable tap_thresh` | No speed had a working band. `probe_accel` is too high, or something is vibrating — a fan (see `disable_fans`), or a stepper. Check the pin with `QUERY_PROBE` first. |
 | `speed N: unusable - tap_thresh M (the top of the range) still misfires` | At this speed even the least sensitive setting misfires. Skipped. |
 | `speed N: unusable - nothing in ... detected the bed` | At this speed nothing in the range felt the contact. Try a lower `THRESHOLD_START` or a higher speed. |
-| `speed N: unusable - M already misfires and P ... misses the bed` | The misfire threshold and the deaf threshold meet with no gap. Lower `probe_accel` to open one up. |
-| `failed the repeatability run` | The chosen threshold passed the trials but not the longer `SAMPLES` run. Results at that speed are marginal; raise `TRIALS` or `MARGIN`. |
+| `speed N: unusable - M already misfires and P, the next value tried, misses the bed` | The misfire threshold and the deaf threshold meet with no gap at this speed. Lower `probe_accel` to open one up. |
+| `failed the repeatability run` | The chosen threshold passed the walk but not the longer `SAMPLES` run. Results at that speed are marginal; raise `TRIALS` or `MARGIN`. |
 
 An aborted run restores the previous `tap_thresh`, lifts back to the height it
 started from, and writes nothing to the config.
